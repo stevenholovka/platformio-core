@@ -12,50 +12,84 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import random
 from glob import glob
-from os import listdir, walk
-from os.path import dirname, getsize, isdir, isfile, join, normpath
 
 import pytest
 
-from platformio import util
+from platformio import fs, proc
+from platformio.compat import PY2
+from platformio.package.manager.platform import PlatformPackageManager
+from platformio.platform.factory import PlatformFactory
+from platformio.project.config import ProjectConfig
 
 
 def pytest_generate_tests(metafunc):
     if "pioproject_dir" not in metafunc.fixturenames:
         return
-    example_dirs = normpath(join(dirname(__file__), "..", "examples"))
-    project_dirs = []
-    for root, _, files in walk(example_dirs):
-        if "platformio.ini" not in files or ".skiptest" in files:
-            continue
-        project_dirs.append(root)
-    project_dirs.sort()
-    metafunc.parametrize("pioproject_dir", project_dirs)
+    examples_dirs = []
 
-
-@pytest.mark.examples
-def test_run(pioproject_dir):
-    if isdir(join(pioproject_dir, ".pioenvs")):
-        util.rmtree_(join(pioproject_dir, ".pioenvs"))
-
-    result = util.exec_command(
-        ["platformio", "--force", "run", "--project-dir", pioproject_dir]
+    # repo examples
+    examples_dirs.append(
+        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "examples"))
     )
-    if result['returncode'] != 0:
-        pytest.fail(result)
 
-    # check .elf file
-    pioenvs_dir = join(pioproject_dir, ".pioenvs")
-    for item in listdir(pioenvs_dir):
-        if not isdir(item):
-            continue
-        assert isfile(join(pioenvs_dir, item, "firmware.elf"))
-        # check .hex or .bin files
-        firmwares = []
-        for ext in ("bin", "hex"):
-            firmwares += glob(join(pioenvs_dir, item, "firmware*.%s" % ext))
-        if not firmwares:
-            pytest.fail("Missed firmware file")
-        for firmware in firmwares:
-            assert getsize(firmware) > 0
+    # dev/platforms
+    for pkg in PlatformPackageManager().get_installed():
+        p = PlatformFactory.new(pkg)
+        examples_dir = os.path.join(p.get_dir(), "examples")
+        if os.path.isdir(examples_dir):
+            examples_dirs.append(examples_dir)
+
+    project_dirs = []
+    for examples_dir in examples_dirs:
+        candidates = {}
+        for root, _, files in os.walk(examples_dir):
+            if "platformio.ini" not in files or ".skiptest" in files:
+                continue
+            if "zephyr-" in root and PY2:
+                continue
+            group = os.path.basename(root)
+            if "-" in group:
+                group = group.split("-", 1)[0]
+            if group not in candidates:
+                candidates[group] = []
+            candidates[group].append(root)
+
+        project_dirs.extend(
+            [random.choice(examples) for examples in candidates.values() if examples]
+        )
+
+    metafunc.parametrize("pioproject_dir", sorted(project_dirs))
+
+
+def test_run(pioproject_dir):
+    with fs.cd(pioproject_dir):
+        config = ProjectConfig()
+        build_dir = config.get_optional_dir("build")
+        if os.path.isdir(build_dir):
+            fs.rmtree(build_dir)
+
+        env_names = config.envs()
+        result = proc.exec_command(
+            ["platformio", "run", "-e", random.choice(env_names)]
+        )
+        if result["returncode"] != 0:
+            pytest.fail(str(result))
+
+        assert os.path.isdir(build_dir)
+
+        # check .elf file
+        for item in os.listdir(build_dir):
+            if not os.path.isdir(item):
+                continue
+            assert os.path.isfile(os.path.join(build_dir, item, "firmware.elf"))
+            # check .hex or .bin files
+            firmwares = []
+            for ext in ("bin", "hex"):
+                firmwares += glob(os.path.join(build_dir, item, "firmware*.%s" % ext))
+            if not firmwares:
+                pytest.fail("Missed firmware file")
+            for firmware in firmwares:
+                assert os.path.getsize(firmware) > 0

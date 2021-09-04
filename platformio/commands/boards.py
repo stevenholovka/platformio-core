@@ -13,13 +13,16 @@
 # limitations under the License.
 
 import json
+import shutil
 
 import click
+from tabulate import tabulate
 
-from platformio.managers.platform import PlatformManager
+from platformio import fs
+from platformio.package.manager.platform import PlatformPackageManager
 
 
-@click.command("boards", short_help="Embedded Board Explorer")
+@click.command("boards", short_help="Embedded board explorer")
 @click.argument("query", required=False)
 @click.option("--installed", is_flag=True)
 @click.option("--json-output", is_flag=True)
@@ -29,64 +32,54 @@ def cli(query, installed, json_output):  # pylint: disable=R0912
 
     grpboards = {}
     for board in _get_boards(installed):
-        if query and query.lower() not in json.dumps(board).lower():
+        if query and not any(
+            query.lower() in str(board.get(k, "")).lower()
+            for k in ("id", "name", "mcu", "vendor", "platform", "frameworks")
+        ):
             continue
-        if board['platform'] not in grpboards:
-            grpboards[board['platform']] = []
-        grpboards[board['platform']].append(board)
+        if board["platform"] not in grpboards:
+            grpboards[board["platform"]] = []
+        grpboards[board["platform"]].append(board)
 
-    terminal_width, _ = click.get_terminal_size()
+    terminal_width, _ = shutil.get_terminal_size()
     for (platform, boards) in sorted(grpboards.items()):
         click.echo("")
         click.echo("Platform: ", nl=False)
         click.secho(platform, bold=True)
-        click.echo("-" * terminal_width)
+        click.echo("=" * terminal_width)
         print_boards(boards)
+    return True
 
 
 def print_boards(boards):
-    terminal_width, _ = click.get_terminal_size()
-    BOARDLIST_TPL = ("{type:<30} {mcu:<14} {frequency:<8} "
-                     " {flash:<7} {ram:<6} {name}")
     click.echo(
-        BOARDLIST_TPL.format(
-            type=click.style("ID", fg="cyan"),
-            mcu="MCU",
-            frequency="Frequency",
-            flash="Flash",
-            ram="RAM",
-            name="Name"))
-    click.echo("-" * terminal_width)
-
-    for board in boards:
-        ram_size = board['ram']
-        if ram_size >= 1024:
-            if ram_size % 1024:
-                ram_size = "%.1fkB" % (ram_size / 1024.0)
-            else:
-                ram_size = "%dkB" % (ram_size / 1024)
-        else:
-            ram_size = "%dB" % ram_size
-
-        click.echo(
-            BOARDLIST_TPL.format(
-                type=click.style(board['id'], fg="cyan"),
-                mcu=board['mcu'],
-                frequency="%dMhz" % (board['fcpu'] / 1000000),
-                flash="%dkB" % (board['rom'] / 1024),
-                ram=ram_size,
-                name=board['name']))
+        tabulate(
+            [
+                (
+                    click.style(b["id"], fg="cyan"),
+                    b["mcu"],
+                    "%dMHz" % (b["fcpu"] / 1000000),
+                    fs.humanize_file_size(b["rom"]),
+                    fs.humanize_file_size(b["ram"]),
+                    b["name"],
+                )
+                for b in boards
+            ],
+            headers=["ID", "MCU", "Frequency", "Flash", "RAM", "Name"],
+        )
+    )
 
 
 def _get_boards(installed=False):
-    pm = PlatformManager()
+    pm = PlatformPackageManager()
     return pm.get_installed_boards() if installed else pm.get_all_boards()
+
 
 def _print_boards_json(query, installed=False):
     result = []
     for board in _get_boards(installed):
         if query:
-            search_data = "%s %s" % (board['id'], json.dumps(board).lower())
+            search_data = "%s %s" % (board["id"], json.dumps(board).lower())
             if query.lower() not in search_data.lower():
                 continue
         result.append(board)

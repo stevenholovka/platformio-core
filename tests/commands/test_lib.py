@@ -12,250 +12,218 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=unused-argument
+
 import json
-import re
-from os.path import basename
+import os
 
-from platformio import exception, util
-from platformio.commands.init import cli as cmd_init
-from platformio.commands.lib import cli as cmd_lib
+import semantic_version
+
+from platformio.clients.registry import RegistryClient
+from platformio.commands.lib.command import cli as cmd_lib
+from platformio.package.meta import PackageType
+from platformio.package.vcsclient import VCSClientFactory
+from platformio.project.config import ProjectConfig
 
 
-def test_search(clirunner, validate_cliresult):
-    result = clirunner.invoke(cmd_lib, ["search", "DHT22"])
+def test_saving_deps(clirunner, validate_cliresult, isolated_pio_core, tmpdir_factory):
+    regclient = RegistryClient()
+    project_dir = tmpdir_factory.mktemp("project")
+    project_dir.join("platformio.ini").write(
+        """
+[env]
+lib_deps = ArduinoJson
+
+[env:one]
+board = devkit
+
+[env:two]
+framework = foo
+lib_deps =
+    CustomLib
+    ArduinoJson @ 5.10.1
+"""
+    )
+    result = clirunner.invoke(
+        cmd_lib,
+        ["-d", str(project_dir), "install", "64", "knolleary/PubSubClient@~2.7"],
+    )
     validate_cliresult(result)
-    match = re.search(r"Found\s+(\d+)\slibraries:", result.output)
-    assert int(match.group(1)) > 2
+    aj_pkg_data = regclient.get_package(PackageType.LIBRARY, "bblanchon", "ArduinoJson")
+    config = ProjectConfig(os.path.join(str(project_dir), "platformio.ini"))
+    assert sorted(config.get("env:one", "lib_deps")) == sorted(
+        [
+            "bblanchon/ArduinoJson@^%s" % aj_pkg_data["version"]["name"],
+            "knolleary/PubSubClient@~2.7",
+        ]
+    )
+    assert sorted(config.get("env:two", "lib_deps")) == sorted(
+        [
+            "CustomLib",
+            "bblanchon/ArduinoJson@^%s" % aj_pkg_data["version"]["name"],
+            "knolleary/PubSubClient@~2.7",
+        ]
+    )
 
-    result = clirunner.invoke(cmd_lib,
-                              ["search", "DHT22", "--platform=timsp430"])
+    # ensure "build" version without NPM spec
+    result = clirunner.invoke(
+        cmd_lib,
+        ["-d", str(project_dir), "-e", "one", "install", "mbed-sam-grove/LinkedList"],
+    )
     validate_cliresult(result)
-    match = re.search(r"Found\s+(\d+)\slibraries:", result.output)
-    assert int(match.group(1)) > 1
+    ll_pkg_data = regclient.get_package(
+        PackageType.LIBRARY, "mbed-sam-grove", "LinkedList"
+    )
+    config = ProjectConfig(os.path.join(str(project_dir), "platformio.ini"))
+    assert sorted(config.get("env:one", "lib_deps")) == sorted(
+        [
+            "bblanchon/ArduinoJson@^%s" % aj_pkg_data["version"]["name"],
+            "knolleary/PubSubClient@~2.7",
+            "mbed-sam-grove/LinkedList@%s" % ll_pkg_data["version"]["name"],
+        ]
+    )
 
-
-def test_global_install_registry(clirunner, validate_cliresult,
-                                 isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install", "58", "547@2.2.4", "DallasTemperature",
-        "http://dl.platformio.org/libraries/archives/3/5174.tar.gz",
-        "ArduinoJson@5.6.7", "ArduinoJson@~5.7.0", "1089@fee16e880b"
-    ])
-    validate_cliresult(result)
-
-    # check lib with duplicate URL
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install",
-        "http://dl.platformio.org/libraries/archives/3/5174.tar.gz"
-    ])
-    validate_cliresult(result)
-    assert "is already installed" in result.output
-
-    # check lib with duplicate ID
-    result = clirunner.invoke(cmd_lib, ["-g", "install", "305"])
-    validate_cliresult(result)
-    assert "is already installed" in result.output
-
-    # install unknown library
-    result = clirunner.invoke(cmd_lib, ["-g", "install", "Unknown"])
-    assert result.exit_code != 0
-    assert isinstance(result.exception, exception.LibNotFound)
-
-    items1 = [d.basename for d in isolated_pio_home.join("lib").listdir()]
-    items2 = [
-        "ArduinoJson_ID64", "ArduinoJson_ID64@5.6.7", "DallasTemperature_ID54",
-        "DHT22_ID58", "ESPAsyncTCP_ID305", "NeoPixelBus_ID547", "OneWire_ID1",
-        "IRremoteESP8266_ID1089"
-    ]
-    assert set(items1) == set(items2)
-
-
-def test_global_install_archive(clirunner, validate_cliresult,
-                                isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install", "https://github.com/adafruit/Adafruit-ST7735-Library/"
-        "archive/master.zip",
-        "http://www.airspayce.com/mikem/arduino/RadioHead/RadioHead-1.62.zip",
-        "https://github.com/bblanchon/ArduinoJson/archive/v5.8.2.zip",
-        "https://github.com/bblanchon/ArduinoJson/archive/v5.8.2.zip@5.8.2"
-    ])
-    validate_cliresult(result)
-
-    # incorrect requirements
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install",
-        "https://github.com/bblanchon/ArduinoJson/archive/v5.8.2.zip@1.2.3"
-    ])
-    assert result.exit_code != 0
-
-    # check lib with duplicate URL
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install",
-        "http://www.airspayce.com/mikem/arduino/RadioHead/RadioHead-1.62.zip"
-    ])
-    validate_cliresult(result)
-    assert "is already installed" in result.output
-
-    items1 = [d.basename for d in isolated_pio_home.join("lib").listdir()]
-    items2 = ["Adafruit ST7735 Library", "RadioHead-1.62"]
-    assert set(items1) >= set(items2)
-
-
-def test_global_install_repository(clirunner, validate_cliresult,
-                                   isolated_pio_home):
+    # check external package via Git repo
     result = clirunner.invoke(
         cmd_lib,
         [
-            "-g",
+            "-d",
+            str(project_dir),
+            "-e",
+            "one",
             "install",
-            "https://github.com/gioblu/PJON.git#3.0",
-            "https://github.com/gioblu/PJON.git#6.2",
-            "https://github.com/bblanchon/ArduinoJson.git",
-            "https://gitlab.com/ivankravets/rs485-nodeproto.git",
-            "https://github.com/platformio/platformio-libmirror.git",
-            # "https://developer.mbed.org/users/simon/code/TextLCD/",
-            "knolleary/pubsubclient"
-        ])
+            "https://github.com/OttoWinter/async-mqtt-client.git#v0.8.3 @ 0.8.3",
+        ],
+    )
     validate_cliresult(result)
-    items1 = [d.basename for d in isolated_pio_home.join("lib").listdir()]
-    items2 = [
-        "PJON", "PJON@src-79de467ebe19de18287becff0a1fb42d",
-        "ArduinoJson@src-69ebddd821f771debe7ee734d3c7fa81", "rs485-nodeproto",
-        "PubSubClient"
-    ]
-    assert set(items1) >= set(items2)
+    config = ProjectConfig(os.path.join(str(project_dir), "platformio.ini"))
+    assert len(config.get("env:one", "lib_deps")) == 4
+    assert config.get("env:one", "lib_deps")[3] == (
+        "https://github.com/OttoWinter/async-mqtt-client.git#v0.8.3 @ 0.8.3"
+    )
 
-    # check lib with duplicate URL
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "install",
-        "https://github.com/platformio/platformio-libmirror.git"
-    ])
-    validate_cliresult(result)
-    assert "is already installed" in result.output
-
-
-def test_global_lib_list(clirunner, validate_cliresult, isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, ["-g", "list"])
-    validate_cliresult(result)
-    assert all([n in result.output for n in ("OneWire", "DHT22", "64")])
-
-    result = clirunner.invoke(cmd_lib, ["-g", "list", "--json-output"])
-    assert all([
-        n in result.output
-        for n in ("PJON", "git+https://github.com/knolleary/pubsubclient",
-                  "https://github.com/bblanchon/ArduinoJson/archive/v5.8.2.zip"
-                  )
-    ])
-    items1 = [i['name'] for i in json.loads(result.output)]
-    items2 = [
-        "OneWire", "DHT22", "PJON", "ESPAsyncTCP", "ArduinoJson",
-        "PubSubClient", "rs485-nodeproto", "Adafruit ST7735 Library",
-        "RadioHead-1.62", "DallasTemperature", "NeoPixelBus",
-        "IRremoteESP8266", "platformio-libmirror"
-    ]
-    assert set(items1) == set(items2)
-
-
-def test_global_lib_update_check(clirunner, validate_cliresult,
-                                 isolated_pio_home):
+    # test uninstalling
+    # from all envs
     result = clirunner.invoke(
-        cmd_lib, ["-g", "update", "--only-check", "--json-output"])
+        cmd_lib, ["-d", str(project_dir), "uninstall", "ArduinoJson"]
+    )
     validate_cliresult(result)
-    output = json.loads(result.output)
-    assert set(["ArduinoJson", "IRremoteESP8266", "NeoPixelBus"]) == set(
-        [l['name'] for l in output])
-
-
-def test_global_lib_update(clirunner, validate_cliresult, isolated_pio_home):
-    # update library using package directory
+    # from "one" env
     result = clirunner.invoke(
         cmd_lib,
-        ["-g", "update", "NeoPixelBus", "--only-check", "--json-output"])
+        [
+            "-d",
+            str(project_dir),
+            "-e",
+            "one",
+            "uninstall",
+            "knolleary/PubSubClient@~2.7",
+        ],
+    )
     validate_cliresult(result)
-    oudated = json.loads(result.output)
-    assert len(oudated) == 1
-    assert "__pkg_dir" in oudated[0]
-    result = clirunner.invoke(cmd_lib,
-                              ["-g", "update", oudated[0]['__pkg_dir']])
-    validate_cliresult(result)
-    assert "Uninstalling NeoPixelBus @ 2.2.4" in result.output
-
-    # update rest libraries
-    result = clirunner.invoke(cmd_lib, ["-g", "update"])
-    validate_cliresult(result)
-    validate_cliresult(result)
-    assert result.output.count("[Skip]") == 5
-    assert result.output.count("[Up-to-date]") == 10
-    assert "Uninstalling ArduinoJson @ 5.7.3" in result.output
-    assert "Uninstalling IRremoteESP8266 @ fee16e880b" in result.output
-
-    # update unknown library
-    result = clirunner.invoke(cmd_lib, ["-g", "update", "Unknown"])
-    assert result.exit_code != 0
-    assert isinstance(result.exception, exception.UnknownPackage)
-
-
-def test_global_lib_uninstall(clirunner, validate_cliresult,
-                              isolated_pio_home):
-    # uninstall using package directory
-    result = clirunner.invoke(cmd_lib, ["-g", "list", "--json-output"])
-    validate_cliresult(result)
-    items = json.loads(result.output)
-    result = clirunner.invoke(cmd_lib,
-                              ["-g", "uninstall", items[0]['__pkg_dir']])
-    validate_cliresult(result)
-    assert "Uninstalling Adafruit ST7735 Library" in result.output
-
-    # uninstall the rest libraries
-    result = clirunner.invoke(cmd_lib, [
-        "-g", "uninstall", "1", "ArduinoJson@!=5.6.7",
-        "https://github.com/bblanchon/ArduinoJson.git", "IRremoteESP8266@>=0.2"
-    ])
-    validate_cliresult(result)
-
-    items1 = [d.basename for d in isolated_pio_home.join("lib").listdir()]
-    items2 = [
-        "ArduinoJson", "ArduinoJson_ID64@5.6.7", "DallasTemperature_ID54",
-        "DHT22_ID58", "ESPAsyncTCP_ID305", "NeoPixelBus_ID547", "PJON",
-        "PJON@src-79de467ebe19de18287becff0a1fb42d", "PubSubClient",
-        "RadioHead-1.62", "rs485-nodeproto", "platformio-libmirror"
+    config = ProjectConfig(os.path.join(str(project_dir), "platformio.ini"))
+    assert len(config.get("env:one", "lib_deps")) == 2
+    assert len(config.get("env:two", "lib_deps")) == 2
+    assert config.get("env:one", "lib_deps") == [
+        "mbed-sam-grove/LinkedList@%s" % ll_pkg_data["version"]["name"],
+        "https://github.com/OttoWinter/async-mqtt-client.git#v0.8.3 @ 0.8.3",
     ]
-    assert set(items1) == set(items2)
+    assert config.get("env:two", "lib_deps") == [
+        "CustomLib",
+        "knolleary/PubSubClient@~2.7",
+    ]
 
-    # uninstall unknown library
-    result = clirunner.invoke(cmd_lib, ["-g", "uninstall", "Unknown"])
-    assert result.exit_code != 0
-    assert isinstance(result.exception, exception.UnknownPackage)
-
-
-def test_lib_show(clirunner, validate_cliresult, isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, ["show", "64"])
+    # test list
+    result = clirunner.invoke(cmd_lib, ["-d", str(project_dir), "list"])
     validate_cliresult(result)
-    assert all(
-        [s in result.output for s in ("ArduinoJson", "Arduino", "Atmel AVR")])
-    result = clirunner.invoke(cmd_lib, ["show", "OneWire"])
+    assert "Version: 0.8.3+sha." in result.stdout
+    assert (
+        "Source: git+https://github.com/OttoWinter/async-mqtt-client.git#v0.8.3"
+        in result.stdout
+    )
+    result = clirunner.invoke(
+        cmd_lib, ["-d", str(project_dir), "list", "--json-output"]
+    )
     validate_cliresult(result)
-    assert "OneWire" in result.output
+    data = {}
+    for key, value in json.loads(result.stdout).items():
+        data[os.path.basename(key)] = value
+    ame_lib = next(
+        item for item in data["one"] if item["name"] == "AsyncMqttClient-esphome"
+    )
+    ame_vcs = VCSClientFactory.new(ame_lib["__pkg_dir"], ame_lib["__src_url"])
+    assert len(data["two"]) == 1
+    assert data["two"][0]["name"] == "PubSubClient"
+    assert "__pkg_dir" in data["one"][0]
+    assert (
+        ame_lib["__src_url"]
+        == "git+https://github.com/OttoWinter/async-mqtt-client.git#v0.8.3"
+    )
+    assert ame_lib["version"] == ("0.8.3+sha.%s" % ame_vcs.get_current_revision())
 
 
-def test_lib_builtin(clirunner, validate_cliresult, isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, ["builtin"])
+def test_update(clirunner, validate_cliresult, isolated_pio_core, tmpdir_factory):
+    storage_dir = tmpdir_factory.mktemp("test-updates")
+    result = clirunner.invoke(
+        cmd_lib,
+        ["-d", str(storage_dir), "install", "ArduinoJson @ 5.10.1", "Blynk @ ~0.5.0"],
+    )
     validate_cliresult(result)
-    result = clirunner.invoke(cmd_lib, ["builtin", "--json-output"])
+    result = clirunner.invoke(
+        cmd_lib, ["-d", str(storage_dir), "update", "--dry-run", "--json-output"]
+    )
     validate_cliresult(result)
+    outdated = json.loads(result.stdout)
+    assert len(outdated) == 2
+    # ArduinoJson
+    assert outdated[0]["version"] == "5.10.1"
+    assert outdated[0]["versionWanted"] is None
+    assert semantic_version.Version(
+        outdated[0]["versionLatest"]
+    ) > semantic_version.Version("6.16.0")
+    # Blynk
+    assert outdated[1]["version"] == "0.5.4"
+    assert outdated[1]["versionWanted"] is None
+    assert semantic_version.Version(
+        outdated[1]["versionLatest"]
+    ) > semantic_version.Version("0.6.0")
 
-
-def test_lib_stats(clirunner, validate_cliresult, isolated_pio_home):
-    result = clirunner.invoke(cmd_lib, ["stats"])
+    # check with spec
+    result = clirunner.invoke(
+        cmd_lib,
+        [
+            "-d",
+            str(storage_dir),
+            "update",
+            "--dry-run",
+            "--json-output",
+            "ArduinoJson @ ^5",
+        ],
+    )
     validate_cliresult(result)
-    assert all([
-        s in result.output
-        for s in ("UPDATED", "ago", "http://platformio.org/lib/show")
-    ])
-
-    result = clirunner.invoke(cmd_lib, ["stats", "--json-output"])
+    outdated = json.loads(result.stdout)
+    assert outdated[0]["version"] == "5.10.1"
+    assert outdated[0]["versionWanted"] == "5.13.4"
+    assert semantic_version.Version(
+        outdated[0]["versionLatest"]
+    ) > semantic_version.Version("6.16.0")
+    # update with spec
+    result = clirunner.invoke(
+        cmd_lib, ["-d", str(storage_dir), "update", "--silent", "ArduinoJson @ ^5.10.1"]
+    )
     validate_cliresult(result)
-    assert set([
-        "dlweek", "added", "updated", "topkeywords", "dlmonth", "dlday",
-        "lastkeywords"
-    ]) == set(json.loads(result.output).keys())
+    result = clirunner.invoke(
+        cmd_lib, ["-d", str(storage_dir), "list", "--json-output"]
+    )
+    validate_cliresult(result)
+    items = json.loads(result.stdout)
+    assert len(items) == 2
+    assert items[0]["version"] == "5.13.4"
+    assert items[1]["version"] == "0.5.4"
+
+    # Check incompatible
+    result = clirunner.invoke(
+        cmd_lib, ["-d", str(storage_dir), "update", "--dry-run", "ArduinoJson @ ^5"]
+    )
+    validate_cliresult(result)
+    assert "Incompatible" in result.stdout

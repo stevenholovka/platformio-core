@@ -48,3 +48,13 @@ void myFunction(struct Item *item) {
 void fooCallback(){
 
 }
+
+extern "C" {
+void some_extern(const char *fmt, ...);
+};
+
+void some_extern(const char *fmt, ...) {
+
+}
+
+// юнікод

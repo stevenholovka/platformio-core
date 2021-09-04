@@ -12,68 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import re
+from zipfile import ZipFile
 
 import click
-import requests
 
-from platformio import VERSION, __version__, exception, util
-from platformio.managers.core import update_core_packages
+from platformio import VERSION, __version__, app, exception
+from platformio.clients.http import fetch_remote_content
+from platformio.compat import IS_WINDOWS
+from platformio.proc import exec_command, get_pythonexe_path
+from platformio.project.helpers import get_project_cache_dir
 
 
-@click.command(
-    "upgrade", short_help="Upgrade PlatformIO to the latest version")
-def cli():
-    # Update PlatformIO's Core packages
-    update_core_packages(silent=True)
-
-    latest = get_latest_version()
-    if __version__ == latest:
+@click.command("upgrade", short_help="Upgrade PlatformIO to the latest version")
+@click.option("--dev", is_flag=True, help="Use development branch")
+def cli(dev):
+    if not dev and __version__ == get_latest_version():
         return click.secho(
             "You're up-to-date!\nPlatformIO %s is currently the "
             "newest version available." % __version__,
-            fg="green")
-    else:
-        click.secho("Please wait while upgrading PlatformIO ...", fg="yellow")
+            fg="green",
+        )
 
-        to_develop = not all([c.isdigit() for c in latest if c != "."])
-        cmds = ([
-            "pip", "install", "--upgrade",
-            "https://github.com/platformio/platformio-core/archive/develop.zip"
-            if to_develop else "platformio"
-        ], ["platformio", "--version"])
+    click.secho("Please wait while upgrading PlatformIO ...", fg="yellow")
 
-        cmd = None
-        r = None
-        try:
-            for cmd in cmds:
-                cmd = [util.get_pythonexe_path(), "-m"] + cmd
-                r = None
-                r = util.exec_command(cmd)
+    to_develop = dev or not all(c.isdigit() for c in __version__ if c != ".")
+    cmds = (
+        ["pip", "install", "--upgrade", download_dist_package(to_develop)],
+        ["platformio", "--version"],
+    )
 
-                # try pip with disabled cache
-                if r['returncode'] != 0 and cmd[2] == "pip":
-                    cmd.insert(3, "--no-cache-dir")
-                    r = util.exec_command(cmd)
+    cmd = None
+    r = {}
+    try:
+        for cmd in cmds:
+            cmd = [get_pythonexe_path(), "-m"] + cmd
+            r = exec_command(cmd)
 
-                assert r['returncode'] == 0
-            assert "version" in r['out']
-            actual_version = r['out'].strip().split("version", 1)[1].strip()
+            # try pip with disabled cache
+            if r["returncode"] != 0 and cmd[2] == "pip":
+                cmd.insert(3, "--no-cache-dir")
+                r = exec_command(cmd)
+
+            assert r["returncode"] == 0
+        assert "version" in r["out"]
+        actual_version = r["out"].strip().split("version", 1)[1].strip()
+        click.secho(
+            "PlatformIO has been successfully upgraded to %s" % actual_version,
+            fg="green",
+        )
+        click.echo("Release notes: ", nl=False)
+        click.secho("https://docs.platformio.org/en/latest/history.html", fg="cyan")
+        if app.get_session_var("caller_id"):
             click.secho(
-                "PlatformIO has been successfully upgraded to %s" %
-                actual_version,
-                fg="green")
-            click.echo("Release notes: ", nl=False)
+                "Warning! Please restart IDE to affect PIO Home changes", fg="yellow"
+            )
+    except Exception as e:  # pylint: disable=broad-except
+        if not r:
+            raise exception.UpgradeError("\n".join([str(cmd), str(e)]))
+        permission_errors = ("permission denied", "not permitted")
+        if any(m in r["err"].lower() for m in permission_errors) and not IS_WINDOWS:
             click.secho(
-                "http://docs.platformio.org/en/latest/history.html", fg="cyan")
-        except Exception as e:  # pylint: disable=W0703
-            if not r:
-                raise exception.UpgradeError("\n".join([str(cmd), str(e)]))
-            permission_errors = ("permission denied", "not permitted")
-            if (any([m in r['err'].lower() for m in permission_errors])
-                    and "windows" not in util.get_systype()):
-                click.secho(
-                    """
+                """
 -----------------
 Permission denied
 -----------------
@@ -83,12 +85,36 @@ You need the `sudo` permission to install Python packages. Try
 
 WARNING! Don't use `sudo` for the rest PlatformIO commands.
 """,
-                    fg="yellow",
-                    err=True)
-                raise exception.ReturnErrorCode(1)
-            else:
-                raise exception.UpgradeError(
-                    "\n".join([str(cmd), r['out'], r['err']]))
+                fg="yellow",
+                err=True,
+            )
+            raise exception.ReturnErrorCode(1)
+        raise exception.UpgradeError("\n".join([str(cmd), r["out"], r["err"]]))
+
+    return True
+
+
+def download_dist_package(to_develop):
+    if not to_develop:
+        return "platformio"
+    dl_url = "https://github.com/platformio/platformio-core/archive/develop.zip"
+    cache_dir = get_project_cache_dir()
+    if not os.path.isdir(cache_dir):
+        os.makedirs(cache_dir)
+    pkg_name = os.path.join(cache_dir, "piocoredevelop.zip")
+    try:
+        with open(pkg_name, "wb") as fp:
+            r = exec_command(
+                ["curl", "-fsSL", dl_url], stdout=fp, universal_newlines=True
+            )
+            assert r["returncode"] == 0
+        # check ZIP structure
+        with ZipFile(pkg_name) as zp:
+            assert zp.testzip() is None
+        return pkg_name
+    except:  # pylint: disable=bare-except
+        pass
+    return dl_url
 
 
 def get_latest_version():
@@ -105,12 +131,11 @@ def get_latest_version():
 
 def get_develop_latest_version():
     version = None
-    r = requests.get(
+    content = fetch_remote_content(
         "https://raw.githubusercontent.com/platformio/platformio"
-        "/develop/platformio/__init__.py",
-        headers=util.get_request_defheaders())
-    r.raise_for_status()
-    for line in r.text.split("\n"):
+        "/develop/platformio/__init__.py"
+    )
+    for line in content.split("\n"):
         line = line.strip()
         if not line.startswith("VERSION"):
             continue
@@ -126,8 +151,5 @@ def get_develop_latest_version():
 
 
 def get_pypi_latest_version():
-    r = requests.get(
-        "https://pypi.python.org/pypi/platformio/json",
-        headers=util.get_request_defheaders())
-    r.raise_for_status()
-    return r.json()['info']['version']
+    content = fetch_remote_content("https://pypi.org/pypi/platformio/json")
+    return json.loads(content)["info"]["version"]
