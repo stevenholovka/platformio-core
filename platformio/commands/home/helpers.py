@@ -12,60 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=keyword-arg-before-vararg, arguments-differ
-
-import os
 import socket
 
 import requests
-from twisted.internet import defer  # pylint: disable=import-error
-from twisted.internet import reactor  # pylint: disable=import-error
-from twisted.internet import threads  # pylint: disable=import-error
+from starlette.concurrency import run_in_threadpool
 
 from platformio import util
+from platformio.compat import IS_WINDOWS
 from platformio.proc import where_is_program
 
 
 class AsyncSession(requests.Session):
-
-    def __init__(self, n=None, *args, **kwargs):
-        if n:
-            pool = reactor.getThreadPool()
-            pool.adjustPoolsize(0, n)
-
-        super(AsyncSession, self).__init__(*args, **kwargs)
-
-    def request(self, *args, **kwargs):
+    async def request(  # pylint: disable=signature-differs,invalid-overridden-method
+        self, *args, **kwargs
+    ):
         func = super(AsyncSession, self).request
-        return threads.deferToThread(func, *args, **kwargs)
-
-    def wrap(self, *args, **kwargs):  # pylint: disable=no-self-use
-        return defer.ensureDeferred(*args, **kwargs)
+        return await run_in_threadpool(func, *args, **kwargs)
 
 
 @util.memoized(expire="60s")
 def requests_session():
-    return AsyncSession(n=5)
+    return AsyncSession()
 
 
 @util.memoized(expire="60s")
 def get_core_fullpath():
-    return where_is_program(
-        "platformio" + (".exe" if "windows" in util.get_systype() else ""))
+    return where_is_program("platformio" + (".exe" if IS_WINDOWS else ""))
 
 
-@util.memoized(expire="10s")
-def is_twitter_blocked():
-    ip = "104.244.42.1"
-    timeout = 2
-    try:
-        if os.getenv("HTTP_PROXY", os.getenv("HTTPS_PROXY")):
-            requests.get("http://%s" % ip,
-                         allow_redirects=False,
-                         timeout=timeout)
-        else:
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((ip, 80))
-        return False
-    except:  # pylint: disable=bare-except
-        pass
+def is_port_used(host, port):
+    socket.setdefaulttimeout(1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if IS_WINDOWS:
+        try:
+            s.bind((host, port))
+            s.close()
+            return False
+        except (OSError, socket.error):
+            pass
+    else:
+        try:
+            s.connect((host, port))
+            s.close()
+        except socket.error:
+            return False
+
     return True

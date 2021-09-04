@@ -13,23 +13,24 @@
 # limitations under the License.
 
 import atexit
-import platform
+import hashlib
+import json
+import os
 import re
+import shutil
 import sys
 import threading
 from collections import deque
-from os import getenv, sep
-from os.path import join
 from time import sleep, time
 from traceback import format_exc
 
-import click
 import requests
 
 from platformio import __version__, app, exception, util
 from platformio.commands import PlatformioCLI
-from platformio.compat import string_types
+from platformio.compat import hashlib_encode_data, string_types
 from platformio.proc import is_ci, is_container
+from platformio.project.helpers import is_platformio_project
 
 try:
     import queue
@@ -38,7 +39,6 @@ except ImportError:
 
 
 class TelemetryBase(object):
-
     def __init__(self):
         self._params = {}
 
@@ -64,22 +64,23 @@ class MeasurementProtocol(TelemetryBase):
         "event_category": "ec",
         "event_action": "ea",
         "event_label": "el",
-        "event_value": "ev"
+        "event_value": "ev",
     }
 
     def __init__(self):
         super(MeasurementProtocol, self).__init__()
-        self['v'] = 1
-        self['tid'] = self.TID
-        self['cid'] = app.get_cid()
+        self["v"] = 1
+        self["tid"] = self.TID
+        self["cid"] = app.get_cid()
 
         try:
-            self['sr'] = "%dx%d" % click.get_terminal_size()
+            self["sr"] = "%dx%d" % shutil.get_terminal_size()
         except ValueError:
             pass
 
         self._prefill_screen_name()
         self._prefill_appinfo()
+        self._prefill_sysargs()
         self._prefill_custom_data()
 
     def __getitem__(self, name):
@@ -93,19 +94,21 @@ class MeasurementProtocol(TelemetryBase):
         super(MeasurementProtocol, self).__setitem__(name, value)
 
     def _prefill_appinfo(self):
-        self['av'] = __version__
+        self["av"] = __version__
+        self["an"] = app.get_user_agent()
 
-        # gather dependent packages
-        dpdata = []
-        dpdata.append("PlatformIO/%s" % __version__)
-        if app.get_session_var("caller_id"):
-            dpdata.append("Caller/%s" % app.get_session_var("caller_id"))
-        if getenv("PLATFORMIO_IDE"):
-            dpdata.append("IDE/%s" % getenv("PLATFORMIO_IDE"))
-        self['an'] = " ".join(dpdata)
+    def _prefill_sysargs(self):
+        args = []
+        for arg in sys.argv[1:]:
+            arg = str(arg)
+            if arg == "account":  # ignore account cmd which can contain username
+                return
+            if any(("@" in arg, "/" in arg, "\\" in arg)):
+                arg = "***"
+            args.append(arg.lower())
+        self["cd3"] = " ".join(args)
 
     def _prefill_custom_data(self):
-
         def _filter_args(items):
             result = []
             stop = False
@@ -119,17 +122,12 @@ class MeasurementProtocol(TelemetryBase):
             return result
 
         caller_id = str(app.get_session_var("caller_id"))
-        self['cd1'] = util.get_systype()
-        self['cd2'] = "Python/%s %s" % (platform.python_version(),
-                                        platform.platform())
-        # self['cd3'] = " ".join(_filter_args(sys.argv[1:]))
-        self['cd4'] = 1 if (not util.is_ci() and
-                            (caller_id or not is_container())) else 0
+        self["cd1"] = util.get_systype()
+        self["cd4"] = 1 if (not is_ci() and (caller_id or not is_container())) else 0
         if caller_id:
-            self['cd5'] = caller_id.lower()
+            self["cd5"] = caller_id.lower()
 
     def _prefill_screen_name(self):
-
         def _first_arg_from_list(args_, list_):
             for _arg in args_:
                 if _arg in list_:
@@ -146,12 +144,31 @@ class MeasurementProtocol(TelemetryBase):
             return
 
         cmd_path = args[:1]
-        if args[0] in ("platform", "platforms", "serialports", "device",
-                       "settings", "account"):
+        if args[0] in (
+            "access",
+            "account",
+            "device",
+            "org",
+            "package",
+            "platform",
+            "project",
+            "settings",
+            "system",
+            "team",
+        ):
             cmd_path = args[:2]
         if args[0] == "lib" and len(args) > 1:
-            lib_subcmds = ("builtin", "install", "list", "register", "search",
-                           "show", "stats", "uninstall", "update")
+            lib_subcmds = (
+                "builtin",
+                "install",
+                "list",
+                "register",
+                "search",
+                "show",
+                "stats",
+                "uninstall",
+                "update",
+            )
             sub_cmd = _first_arg_from_list(args[1:], lib_subcmds)
             if sub_cmd:
                 cmd_path.append(sub_cmd)
@@ -165,24 +182,22 @@ class MeasurementProtocol(TelemetryBase):
                     sub_cmd = _first_arg_from_list(args[2:], remote2_subcmds)
                     if sub_cmd:
                         cmd_path.append(sub_cmd)
-        self['screen_name'] = " ".join([p.title() for p in cmd_path])
+        self["screen_name"] = " ".join([p.title() for p in cmd_path])
 
-    @staticmethod
-    def _ignore_hit():
+    def _ignore_hit(self):
         if not app.get_setting("enable_telemetry"):
             return True
-        if app.get_session_var("caller_id") and \
-                all(c in sys.argv for c in ("run", "idedata")):
+        if all(c in sys.argv for c in ("run", "idedata")) or self["ea"] == "Idedata":
             return True
         return False
 
     def send(self, hittype):
         if self._ignore_hit():
             return
-        self['t'] = hittype
+        self["t"] = hittype
         # correct queue time
-        if "qt" in self._params and isinstance(self['qt'], float):
-            self['qt'] = int((time() - self['qt']) * 1000)
+        if "qt" in self._params and isinstance(self["qt"], float):
+            self["qt"] = int((time() - self["qt"]) * 1000)
         MPDataPusher().push(self._params)
 
 
@@ -202,7 +217,7 @@ class MPDataPusher(object):
         # if network is off-line
         if self._http_offline:
             if "qt" not in item:
-                item['qt'] = time()
+                item["qt"] = time()
             self._failedque.append(item)
             return
 
@@ -243,7 +258,7 @@ class MPDataPusher(object):
                 item = self._queue.get()
                 _item = item.copy()
                 if "qt" not in _item:
-                    _item['qt'] = time()
+                    _item["qt"] = time()
                 self._failedque.append(_item)
                 if self._send_data(item):
                     self._failedque.remove(_item)
@@ -258,8 +273,9 @@ class MPDataPusher(object):
             r = self._http_session.post(
                 "https://ssl.google-analytics.com/collect",
                 data=data,
-                headers=util.get_request_defheaders(),
-                timeout=1)
+                headers={"User-Agent": app.get_user_agent()},
+                timeout=1,
+            )
             r.raise_for_status()
             return True
         except requests.exceptions.HTTPError as e:
@@ -282,72 +298,102 @@ def on_command():
         measure_ci()
 
 
+def on_exception(e):
+    skip_conditions = [
+        isinstance(e, cls)
+        for cls in (
+            IOError,
+            exception.ReturnErrorCode,
+            exception.UserSideException,
+        )
+    ]
+    if any(skip_conditions):
+        return
+    is_fatal = any(
+        [
+            not isinstance(e, exception.PlatformioException),
+            "Error" in e.__class__.__name__,
+        ]
+    )
+    description = "%s: %s" % (
+        type(e).__name__,
+        " ".join(reversed(format_exc().split("\n"))) if is_fatal else str(e),
+    )
+    send_exception(description, is_fatal)
+
+
 def measure_ci():
     event = {"category": "CI", "action": "NoName", "label": None}
-    known_cis = ("TRAVIS", "APPVEYOR", "GITLAB_CI", "CIRCLECI", "SHIPPABLE",
-                 "DRONE")
+    known_cis = (
+        "GITHUB_ACTIONS",
+        "TRAVIS",
+        "APPVEYOR",
+        "GITLAB_CI",
+        "CIRCLECI",
+        "SHIPPABLE",
+        "DRONE",
+    )
     for name in known_cis:
-        if getenv(name, "false").lower() == "true":
-            event['action'] = name
+        if os.getenv(name, "false").lower() == "true":
+            event["action"] = name
             break
-    on_event(**event)
+    send_event(**event)
 
 
-def on_run_environment(options, targets):
-    non_sensative_values = ["board", "platform", "framework"]
-    safe_options = []
-    for key, value in sorted(options.items()):
-        if key in non_sensative_values:
-            safe_options.append("%s=%s" % (key, value))
-        else:
-            safe_options.append(key)
-    targets = [t.title() for t in targets or ["run"]]
-    on_event("Env", " ".join(targets), "&".join(safe_options))
+def dump_run_environment(options):
+    non_sensitive_data = [
+        "platform",
+        "platform_packages",
+        "framework",
+        "board",
+        "upload_protocol",
+        "check_tool",
+        "debug_tool",
+        "monitor_filters",
+    ]
+    safe_options = {k: v for k, v in options.items() if k in non_sensitive_data}
+    if is_platformio_project(os.getcwd()):
+        phash = hashlib.sha1(hashlib_encode_data(app.get_cid()))
+        safe_options["pid"] = phash.hexdigest()
+    return json.dumps(safe_options, sort_keys=True, ensure_ascii=False)
 
 
-def on_event(category, action, label=None, value=None, screen_name=None):
+def send_run_environment(options, targets):
+    send_event(
+        "Env",
+        " ".join([t.title() for t in targets or ["run"]]),
+        dump_run_environment(options),
+    )
+
+
+def send_event(category, action, label=None, value=None, screen_name=None):
     mp = MeasurementProtocol()
-    mp['event_category'] = category[:150]
-    mp['event_action'] = action[:500]
+    mp["event_category"] = category[:150]
+    mp["event_action"] = action[:500]
     if label:
-        mp['event_label'] = label[:500]
+        mp["event_label"] = label[:500]
     if value:
-        mp['event_value'] = int(value)
+        mp["event_value"] = int(value)
     if screen_name:
-        mp['screen_name'] = screen_name[:2048]
+        mp["screen_name"] = screen_name[:2048]
     mp.send("event")
 
 
-def on_exception(e):
+def send_exception(description, is_fatal=False):
+    # cleanup sensitive information, such as paths
+    description = description.replace("Traceback (most recent call last):", "")
+    description = description.replace("\\", "/")
+    description = re.sub(
+        r'(^|\s+|")(?:[a-z]\:)?((/[^"/]+)+)(\s+|"|$)',
+        lambda m: " %s " % os.path.join(*m.group(2).split("/")[-2:]),
+        description,
+        re.I | re.M,
+    )
+    description = re.sub(r"\s+", " ", description, flags=re.M)
 
-    def _cleanup_description(text):
-        text = text.replace("Traceback (most recent call last):", "")
-        text = re.sub(r'File "([^"]+)"',
-                      lambda m: join(*m.group(1).split(sep)[-2:]),
-                      text,
-                      flags=re.M)
-        text = re.sub(r"\s+", " ", text, flags=re.M)
-        return text.strip()
-
-    skip_conditions = [
-        isinstance(e, cls) for cls in (IOError, exception.ReturnErrorCode,
-                                       exception.UserSideException,
-                                       exception.PlatformIOProjectException)
-    ]
-    try:
-        skip_conditions.append("[API] Account: " in str(e))
-    except UnicodeEncodeError as ue:
-        e = ue
-    if any(skip_conditions):
-        return
-    is_crash = any([
-        not isinstance(e, exception.PlatformioException),
-        "Error" in e.__class__.__name__
-    ])
     mp = MeasurementProtocol()
-    description = _cleanup_description(format_exc() if is_crash else str(e))
-    mp['exd'] = ("%s: %s" % (type(e).__name__, description))[:2048]
-    mp['exf'] = 1 if is_crash else 0
+    mp["exd"] = description[:8192].strip()
+    mp["exf"] = 1 if is_fatal else 0
     mp.send("exception")
 
 
@@ -373,7 +419,7 @@ def backup_reports(items):
     KEEP_MAX_REPORTS = 100
     tm = app.get_state_item("telemetry", {})
     if "backup" not in tm:
-        tm['backup'] = []
+        tm["backup"] = []
 
     for params in items:
         # skip static options
@@ -383,28 +429,28 @@ def backup_reports(items):
 
         # store time in UNIX format
         if "qt" not in params:
-            params['qt'] = time()
-        elif not isinstance(params['qt'], float):
-            params['qt'] = time() - (params['qt'] / 1000)
+            params["qt"] = time()
+        elif not isinstance(params["qt"], float):
+            params["qt"] = time() - (params["qt"] / 1000)
 
-        tm['backup'].append(params)
+        tm["backup"].append(params)
 
-    tm['backup'] = tm['backup'][KEEP_MAX_REPORTS * -1:]
+    tm["backup"] = tm["backup"][KEEP_MAX_REPORTS * -1 :]
     app.set_state_item("telemetry", tm)
 
 
 def resend_backuped_reports():
     tm = app.get_state_item("telemetry", {})
-    if "backup" not in tm or not tm['backup']:
+    if "backup" not in tm or not tm["backup"]:
         return False
 
-    for report in tm['backup']:
+    for report in tm["backup"]:
         mp = MeasurementProtocol()
         for key, value in report.items():
             mp[key] = value
-        mp.send(report['t'])
+        mp.send(report["t"])
 
     # clean
-    tm['backup'] = []
+    tm["backup"] = []
     app.set_state_item("telemetry", tm)
     return True

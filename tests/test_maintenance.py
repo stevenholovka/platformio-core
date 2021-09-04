@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=unused-argument
+
 import json
+import os
 import re
 from time import time
 
 from platformio import app, maintenance
 from platformio.__main__ import cli as cli_pio
 from platformio.commands import upgrade as cmd_upgrade
-from platformio.managers.platform import PlatformManager
 
 
-def test_check_pio_upgrade(clirunner, isolated_pio_home, validate_cliresult):
-
+def test_check_pio_upgrade(clirunner, isolated_pio_core, validate_cliresult):
     def _patch_pio_version(version):
         maintenance.__version__ = version
         cmd_upgrade.VERSION = version.split(".", 3)
@@ -52,10 +53,9 @@ def test_check_pio_upgrade(clirunner, isolated_pio_home, validate_cliresult):
     _patch_pio_version(origin_version)
 
 
-def test_check_lib_updates(clirunner, isolated_pio_home, validate_cliresult):
+def test_check_lib_updates(clirunner, isolated_pio_core, validate_cliresult):
     # install obsolete library
-    result = clirunner.invoke(cli_pio,
-                              ["lib", "-g", "install", "ArduinoJson@<5.7"])
+    result = clirunner.invoke(cli_pio, ["lib", "-g", "install", "ArduinoJson@<6.13"])
     validate_cliresult(result)
 
     # reset check time
@@ -65,15 +65,14 @@ def test_check_lib_updates(clirunner, isolated_pio_home, validate_cliresult):
 
     result = clirunner.invoke(cli_pio, ["lib", "-g", "list"])
     validate_cliresult(result)
-    assert ("There are the new updates for libraries (ArduinoJson)" in
-            result.output)
+    assert "There are the new updates for libraries (ArduinoJson)" in result.output
 
 
-def test_check_and_update_libraries(clirunner, isolated_pio_home,
-                                    validate_cliresult):
+def test_check_and_update_libraries(clirunner, isolated_pio_core, validate_cliresult):
     # enable library auto-updates
     result = clirunner.invoke(
-        cli_pio, ["settings", "set", "auto_update_libraries", "Yes"])
+        cli_pio, ["settings", "set", "auto_update_libraries", "Yes"]
+    )
 
     # reset check time
     interval = int(app.get_setting("check_libraries_interval")) * 3600 * 24
@@ -89,30 +88,28 @@ def test_check_and_update_libraries(clirunner, isolated_pio_home,
     # initiate auto-updating
     result = clirunner.invoke(cli_pio, ["lib", "-g", "show", "ArduinoJson"])
     validate_cliresult(result)
-    assert ("There are the new updates for libraries (ArduinoJson)" in
-            result.output)
+    assert "There are the new updates for libraries (ArduinoJson)" in result.output
     assert "Please wait while updating libraries" in result.output
-    assert re.search(r"Updating ArduinoJson\s+@ 5.6.7\s+\[[\d\.]+\]",
-                     result.output)
+    assert re.search(
+        r"Updating bblanchon/ArduinoJson\s+6\.12\.0\s+\[Updating to [\d\.]+\]",
+        result.output,
+    )
 
     # check updated version
     result = clirunner.invoke(cli_pio, ["lib", "-g", "list", "--json-output"])
     validate_cliresult(result)
-    assert prev_data[0]['version'] != json.loads(result.output)[0]['version']
+    assert prev_data[0]["version"] != json.loads(result.output)[0]["version"]
 
 
-def test_check_platform_updates(clirunner, isolated_pio_home,
-                                validate_cliresult):
+def test_check_platform_updates(clirunner, isolated_pio_core, validate_cliresult):
     # install obsolete platform
     result = clirunner.invoke(cli_pio, ["platform", "install", "native"])
     validate_cliresult(result)
-    manifest_path = isolated_pio_home.join("platforms", "native",
-                                           "platform.json")
+    os.remove(str(isolated_pio_core.join("platforms", "native", ".piopm")))
+    manifest_path = isolated_pio_core.join("platforms", "native", "platform.json")
     manifest = json.loads(manifest_path.read())
-    manifest['version'] = "0.0.0"
+    manifest["version"] = "0.0.0"
     manifest_path.write(json.dumps(manifest))
-    # reset cached manifests
-    PlatformManager().cache_reset()
 
     # reset check time
     interval = int(app.get_setting("check_platforms_interval")) * 3600 * 24
@@ -124,11 +121,11 @@ def test_check_platform_updates(clirunner, isolated_pio_home,
     assert "There are the new updates for platforms (native)" in result.output
 
 
-def test_check_and_update_platforms(clirunner, isolated_pio_home,
-                                    validate_cliresult):
+def test_check_and_update_platforms(clirunner, isolated_pio_core, validate_cliresult):
     # enable library auto-updates
     result = clirunner.invoke(
-        cli_pio, ["settings", "set", "auto_update_platforms", "Yes"])
+        cli_pio, ["settings", "set", "auto_update_platforms", "Yes"]
+    )
 
     # reset check time
     interval = int(app.get_setting("check_platforms_interval")) * 3600 * 24
@@ -146,9 +143,11 @@ def test_check_and_update_platforms(clirunner, isolated_pio_home,
     validate_cliresult(result)
     assert "There are the new updates for platforms (native)" in result.output
     assert "Please wait while updating platforms" in result.output
-    assert re.search(r"Updating native\s+@ 0.0.0\s+\[[\d\.]+\]", result.output)
+    assert re.search(
+        r"Updating native\s+0.0.0\s+\[Updating to [\d\.]+\]", result.output
+    )
 
     # check updated version
     result = clirunner.invoke(cli_pio, ["platform", "list", "--json-output"])
     validate_cliresult(result)
-    assert prev_data[0]['version'] != json.loads(result.output)[0]['version']
+    assert prev_data[0]["version"] != json.loads(result.output)[0]["version"]

@@ -12,57 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=import-outside-toplevel
+
 import os
 import sys
 from traceback import format_exc
 
 import click
 
-from platformio import __version__, exception, maintenance, util
+from platformio import __version__, exception
 from platformio.commands import PlatformioCLI
-from platformio.compat import CYGWIN
+from platformio.compat import IS_CYGWIN, ensure_python3
+
+try:
+    import click_completion  # pylint: disable=import-error
+
+    click_completion.init()
+except:  # pylint: disable=bare-except
+    pass
 
 
-@click.command(cls=PlatformioCLI,
-               context_settings=dict(help_option_names=["-h", "--help"]))
-@click.version_option(__version__, prog_name="PlatformIO")
-@click.option("--force",
-              "-f",
-              is_flag=True,
-              help="Force to accept any confirmation prompts.")
-@click.option("--caller", "-c", help="Caller ID (service).")
+@click.command(
+    cls=PlatformioCLI, context_settings=dict(help_option_names=["-h", "--help"])
+)
+@click.version_option(__version__, prog_name="PlatformIO Core")
+@click.option("--force", "-f", is_flag=True, help="DEPRECATE")
+@click.option("--caller", "-c", help="Caller ID (service)")
+@click.option("--no-ansi", is_flag=True, help="Do not print ANSI control characters")
 @click.pass_context
-def cli(ctx, force, caller):
+def cli(ctx, force, caller, no_ansi):
+    try:
+        if (
+            no_ansi
+            or str(
+                os.getenv("PLATFORMIO_NO_ANSI", os.getenv("PLATFORMIO_DISABLE_COLOR"))
+            ).lower()
+            == "true"
+        ):
+            # pylint: disable=protected-access
+            click._compat.isatty = lambda stream: False
+        elif (
+            str(
+                os.getenv("PLATFORMIO_FORCE_ANSI", os.getenv("PLATFORMIO_FORCE_COLOR"))
+            ).lower()
+            == "true"
+        ):
+            # pylint: disable=protected-access
+            click._compat.isatty = lambda stream: True
+    except:  # pylint: disable=bare-except
+        pass
+
+    from platformio import maintenance
+
     maintenance.on_platformio_start(ctx, force, caller)
 
 
 @cli.resultcallback()
 @click.pass_context
-def process_result(ctx, result, force, caller):  # pylint: disable=W0613
+def process_result(ctx, result, *_, **__):
+    from platformio import maintenance
+
     maintenance.on_platformio_end(ctx, result)
 
 
-@util.memoized()
 def configure():
-    if CYGWIN:
+    if IS_CYGWIN:
         raise exception.CygwinEnvDetected()
 
     # https://urllib3.readthedocs.org
     # /en/latest/security.html#insecureplatformwarning
     try:
-        import urllib3
+        import urllib3  # pylint: disable=import-outside-toplevel
+
         urllib3.disable_warnings()
     except (AttributeError, ImportError):
-        pass
-
-    try:
-        if str(os.getenv("PLATFORMIO_DISABLE_COLOR", "")).lower() == "true":
-            # pylint: disable=protected-access
-            click._compat.isatty = lambda stream: False
-        elif str(os.getenv("PLATFORMIO_FORCE_COLOR", "")).lower() == "true":
-            # pylint: disable=protected-access
-            click._compat.isatty = lambda stream: True
-    except:  # pylint: disable=bare-except
         pass
 
     # Handle IOError issue with VSCode's Terminal (Windows)
@@ -73,7 +96,8 @@ def configure():
             click_echo_origin[origin](*args, **kwargs)
         except IOError:
             (sys.stderr.write if kwargs.get("err") else sys.stdout.write)(
-                "%s\n" % (args[0] if args else ""))
+                "%s\n" % (args[0] if args else "")
+            )
 
     click.echo = lambda *args, **kwargs: _safe_echo(0, *args, **kwargs)
     click.secho = lambda *args, **kwargs: _safe_echo(1, *args, **kwargs)
@@ -86,13 +110,18 @@ def main(argv=None):
         assert isinstance(argv, list)
         sys.argv = argv
     try:
+        ensure_python3(raise_exception=True)
         configure()
-        cli(None, None, None)
-    except SystemExit:
-        pass
+        cli()  # pylint: disable=no-value-for-parameter
+    except SystemExit as e:
+        if e.code and str(e.code).isdigit():
+            exit_code = int(e.code)
     except Exception as e:  # pylint: disable=broad-except
         if not isinstance(e, exception.ReturnErrorCode):
-            maintenance.on_platformio_exception(e)
+            if sys.version_info.major != 2:
+                from platformio import maintenance
+
+                maintenance.on_platformio_exception(e)
             error_str = "Error: "
             if isinstance(e, exception.PlatformioException):
                 error_str += str(e)

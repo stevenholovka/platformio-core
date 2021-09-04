@@ -15,18 +15,22 @@
 import os
 import subprocess
 import sys
-from os.path import isdir, isfile, join, normpath
+from contextlib import contextmanager
 from threading import Thread
 
 from platformio import exception
-from platformio.compat import WINDOWS, string_types
+from platformio.compat import (
+    IS_WINDOWS,
+    get_filesystem_encoding,
+    get_locale_encoding,
+    string_types,
+)
 
 
 class AsyncPipeBase(object):
-
     def __init__(self):
         self._fd_read, self._fd_write = os.pipe()
-        self._pipe_reader = os.fdopen(self._fd_read)
+        self._pipe_reader = os.fdopen(self._fd_read, errors="backslashreplace")
         self._buffer = ""
         self._thread = Thread(target=self.run)
         self._thread.start()
@@ -53,7 +57,6 @@ class AsyncPipeBase(object):
 
 
 class BuildAsyncPipe(AsyncPipeBase):
-
     def __init__(self, line_callback, data_callback):
         self.line_callback = line_callback
         self.data_callback = data_callback
@@ -63,10 +66,10 @@ class BuildAsyncPipe(AsyncPipeBase):
         line = ""
         print_immediately = False
 
-        for byte in iter(lambda: self._pipe_reader.read(1), ""):
-            self._buffer += byte
+        for char in iter(lambda: self._pipe_reader.read(1), ""):
+            self._buffer += char
 
-            if line and byte.strip() and line[-3:] == (byte * 3):
+            if line and char.strip() and line[-3:] == (char * 3):
                 print_immediately = True
 
             if print_immediately:
@@ -74,12 +77,12 @@ class BuildAsyncPipe(AsyncPipeBase):
                 if line:
                     self.data_callback(line)
                     line = ""
-                self.data_callback(byte)
-                if byte == "\n":
+                self.data_callback(char)
+                if char == "\n":
                     print_immediately = False
             else:
-                line += byte
-                if byte != "\n":
+                line += char
+                if char != "\n":
                     continue
                 self.line_callback(line)
                 line = ""
@@ -88,7 +91,6 @@ class BuildAsyncPipe(AsyncPipeBase):
 
 
 class LineBufferedAsyncPipe(AsyncPipeBase):
-
     def __init__(self, line_callback):
         self.line_callback = line_callback
         super(LineBufferedAsyncPipe, self).__init__()
@@ -107,31 +109,44 @@ def exec_command(*args, **kwargs):
     default.update(kwargs)
     kwargs = default
 
-    p = subprocess.Popen(*args, **kwargs)
-    try:
-        result['out'], result['err'] = p.communicate()
-        result['returncode'] = p.returncode
-    except KeyboardInterrupt:
-        raise exception.AbortedByUser()
-    finally:
-        for s in ("stdout", "stderr"):
-            if isinstance(kwargs[s], AsyncPipeBase):
-                kwargs[s].close()
+    with subprocess.Popen(*args, **kwargs) as p:
+        try:
+            result["out"], result["err"] = p.communicate()
+            result["returncode"] = p.returncode
+        except KeyboardInterrupt:
+            raise exception.AbortedByUser()
+        finally:
+            for s in ("stdout", "stderr"):
+                if isinstance(kwargs[s], AsyncPipeBase):
+                    kwargs[s].close()  # pylint: disable=no-member
 
     for s in ("stdout", "stderr"):
         if isinstance(kwargs[s], AsyncPipeBase):
-            result[s[3:]] = kwargs[s].get_buffer()
+            result[s[3:]] = kwargs[s].get_buffer()  # pylint: disable=no-member
 
-    for k, v in result.items():
-        if isinstance(result[k], bytes):
+    for key, value in result.items():
+        if isinstance(value, bytes):
             try:
-                result[k] = result[k].decode(sys.getdefaultencoding())
+                result[key] = value.decode(
+                    get_locale_encoding() or get_filesystem_encoding()
+                )
             except UnicodeDecodeError:
-                result[k] = result[k].decode("latin-1")
-        if v and isinstance(v, string_types):
-            result[k] = result[k].strip()
+                result[key] = value.decode("latin-1")
+        if value and isinstance(value, string_types):
+            result[key] = value.strip()
 
     return result
+
+
+@contextmanager
+def capture_std_streams(stdout, stderr=None):
+    _stdout = sys.stdout
+    _stderr = sys.stderr
+    sys.stdout = stdout
+    sys.stderr = stderr or stdout
+    yield
+    sys.stdout = _stdout
+    sys.stderr = _stderr
 
 
 def is_ci():
@@ -139,18 +154,16 @@ def is_ci():
 
 
 def is_container():
-    if not isfile("/proc/1/cgroup"):
+    if os.path.exists("/.dockerenv"):
+        return True
+    if not os.path.isfile("/proc/1/cgroup"):
         return False
-    with open("/proc/1/cgroup") as fp:
-        for line in fp:
-            line = line.strip()
-            if ":" in line and not line.endswith(":/"):
-                return True
-    return False
+    with open("/proc/1/cgroup", encoding="utf8") as fp:
+        return ":/docker/" in fp.read()
 
 
 def get_pythonexe_path():
-    return os.environ.get("PYTHONEXEPATH", normpath(sys.executable))
+    return os.environ.get("PYTHONEXEPATH", os.path.normpath(sys.executable))
 
 
 def copy_pythonpath_to_osenv():
@@ -159,33 +172,46 @@ def copy_pythonpath_to_osenv():
         _PYTHONPATH = os.environ.get("PYTHONPATH").split(os.pathsep)
     for p in os.sys.path:
         conditions = [p not in _PYTHONPATH]
-        if not WINDOWS:
+        if not IS_WINDOWS:
             conditions.append(
-                isdir(join(p, "click")) or isdir(join(p, "platformio")))
+                os.path.isdir(os.path.join(p, "click"))
+                or os.path.isdir(os.path.join(p, "platformio"))
+            )
         if all(conditions):
             _PYTHONPATH.append(p)
-    os.environ['PYTHONPATH'] = os.pathsep.join(_PYTHONPATH)
+    os.environ["PYTHONPATH"] = os.pathsep.join(_PYTHONPATH)
 
 
 def where_is_program(program, envpath=None):
     env = os.environ
     if envpath:
-        env['PATH'] = envpath
+        env["PATH"] = envpath
 
     # try OS's built-in commands
     try:
-        result = exec_command(["where" if WINDOWS else "which", program],
-                              env=env)
-        if result['returncode'] == 0 and isfile(result['out'].strip()):
-            return result['out'].strip()
+        result = exec_command(["where" if IS_WINDOWS else "which", program], env=env)
+        if result["returncode"] == 0 and os.path.isfile(result["out"].strip()):
+            return result["out"].strip()
     except OSError:
         pass
 
     # look up in $PATH
     for bin_dir in env.get("PATH", "").split(os.pathsep):
-        if isfile(join(bin_dir, program)):
-            return join(bin_dir, program)
-        if isfile(join(bin_dir, "%s.exe" % program)):
-            return join(bin_dir, "%s.exe" % program)
+        if os.path.isfile(os.path.join(bin_dir, program)):
+            return os.path.join(bin_dir, program)
+        if os.path.isfile(os.path.join(bin_dir, "%s.exe" % program)):
+            return os.path.join(bin_dir, "%s.exe" % program)
 
     return program
+
+
+def append_env_path(name, value):
+    cur_value = os.environ.get(name) or ""
+    if cur_value and value in cur_value.split(os.pathsep):
+        return cur_value
+    os.environ[name] = os.pathsep.join([cur_value, value])
+    return os.environ[name]
+
+
+def force_exit(code=0):
+    os._exit(code)  # pylint: disable=protected-access

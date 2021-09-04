@@ -17,18 +17,15 @@ from __future__ import absolute_import
 import json
 import os
 import sys
-from io import BytesIO, StringIO
+from io import StringIO
 
 import click
-import jsonrpc  # pylint: disable=import-error
-from twisted.internet import defer  # pylint: disable=import-error
-from twisted.internet import threads  # pylint: disable=import-error
-from twisted.internet import utils  # pylint: disable=import-error
+from ajsonrpc.core import JSONRPC20DispatchException
+from starlette.concurrency import run_in_threadpool
 
-from platformio import __main__, __version__, fs
+from platformio import __main__, __version__, fs, proc
 from platformio.commands.home import helpers
-from platformio.compat import (PY2, get_filesystem_encoding, is_bytes,
-                               string_types)
+from platformio.compat import get_locale_encoding, is_bytes
 
 try:
     from thread import get_ident as thread_get_ident
@@ -37,7 +34,6 @@ except ImportError:
 
 
 class MultiThreadingStdStream(object):
-
     def __init__(self, parent_stream):
         self._buffers = {thread_get_ident(): parent_stream}
 
@@ -48,27 +44,27 @@ class MultiThreadingStdStream(object):
 
     def _ensure_thread_buffer(self, thread_id):
         if thread_id not in self._buffers:
-            self._buffers[thread_id] = BytesIO() if PY2 else StringIO()
+            self._buffers[thread_id] = StringIO()
 
     def write(self, value):
         thread_id = thread_get_ident()
         self._ensure_thread_buffer(thread_id)
         return self._buffers[thread_id].write(
-            value.decode() if is_bytes(value) else value)
+            value.decode() if is_bytes(value) else value
+        )
 
     def get_value_and_reset(self):
         result = ""
         try:
             result = self.getvalue()
-            self.truncate(0)
             self.seek(0)
+            self.truncate(0)
         except AttributeError:
             pass
         return result
 
 
-class PIOCoreRPC(object):
-
+class PIOCoreRPC:
     @staticmethod
     def version():
         return __version__
@@ -83,64 +79,63 @@ class PIOCoreRPC(object):
         sys.stderr = PIOCoreRPC.thread_stderr
 
     @staticmethod
-    def call(args, options=None):
-        return defer.maybeDeferred(PIOCoreRPC._call_generator, args, options)
-
-    @staticmethod
-    @defer.inlineCallbacks
-    def _call_generator(args, options=None):
+    async def call(args, options=None):
         for i, arg in enumerate(args):
-            if isinstance(arg, string_types):
-                args[i] = arg.encode(get_filesystem_encoding()) if PY2 else arg
-            else:
+            if not isinstance(arg, str):
                 args[i] = str(arg)
 
+        options = options or {}
         to_json = "--json-output" in args
 
         try:
-            if args and args[0] in ("account", "remote"):
-                result = yield PIOCoreRPC._call_subprocess(args, options)
-                defer.returnValue(PIOCoreRPC._process_result(result, to_json))
-            else:
-                result = yield PIOCoreRPC._call_inline(args, options)
-                try:
-                    defer.returnValue(
-                        PIOCoreRPC._process_result(result, to_json))
-                except ValueError:
-                    # fall-back to subprocess method
-                    result = yield PIOCoreRPC._call_subprocess(args, options)
-                    defer.returnValue(
-                        PIOCoreRPC._process_result(result, to_json))
+            if options.get("force_subprocess"):
+                result = await PIOCoreRPC._call_subprocess(args, options)
+                return PIOCoreRPC._process_result(result, to_json)
+            result = await PIOCoreRPC._call_inline(args, options)
+            try:
+                return PIOCoreRPC._process_result(result, to_json)
+            except ValueError:
+                # fall-back to subprocess method
+                result = await PIOCoreRPC._call_subprocess(args, options)
+                return PIOCoreRPC._process_result(result, to_json)
         except Exception as e:  # pylint: disable=bare-except
-            raise jsonrpc.exceptions.JSONRPCDispatchException(
-                code=4003, message="PIO Core Call Error", data=str(e))
+            raise JSONRPC20DispatchException(
+                code=4003, message="PIO Core Call Error", data=str(e)
+            )
 
     @staticmethod
-    def _call_inline(args, options):
-        PIOCoreRPC.setup_multithreading_std_streams()
-        cwd = (options or {}).get("cwd") or os.getcwd()
+    async def _call_subprocess(args, options):
+        result = await run_in_threadpool(
+            proc.exec_command,
+            [helpers.get_core_fullpath()] + args,
+            cwd=options.get("cwd") or os.getcwd(),
+        )
+        return (result["out"], result["err"], result["returncode"])
 
-        def _thread_task():
+    @staticmethod
+    async def _call_inline(args, options):
+        PIOCoreRPC.setup_multithreading_std_streams()
+
+        def _thread_safe_call(args, cwd):
             with fs.cd(cwd):
                 exit_code = __main__.main(["-c"] + args)
-            return (PIOCoreRPC.thread_stdout.get_value_and_reset(),
-                    PIOCoreRPC.thread_stderr.get_value_and_reset(), exit_code)
+            return (
+                PIOCoreRPC.thread_stdout.get_value_and_reset(),
+                PIOCoreRPC.thread_stderr.get_value_and_reset(),
+                exit_code,
+            )
 
-        return threads.deferToThread(_thread_task)
-
-    @staticmethod
-    def _call_subprocess(args, options):
-        cwd = (options or {}).get("cwd") or os.getcwd()
-        return utils.getProcessOutputAndValue(
-            helpers.get_core_fullpath(),
-            args,
-            path=cwd,
-            env={k: v
-                 for k, v in os.environ.items() if "%" not in k})
+        return await run_in_threadpool(
+            _thread_safe_call, args=args, cwd=options.get("cwd") or os.getcwd()
+        )
 
     @staticmethod
     def _process_result(result, to_json=False):
         out, err, code = result
+        if out and is_bytes(out):
+            out = out.decode(get_locale_encoding())
+        if err and is_bytes(err):
+            err = err.decode(get_locale_encoding())
         text = ("%s\n\n%s" % (out, err)).strip()
         if code != 0:
             raise Exception(text)

@@ -14,17 +14,39 @@
 
 from setuptools import find_packages, setup
 
-from platformio import (__author__, __description__, __email__, __license__,
-                        __title__, __url__, __version__)
+from platformio import (
+    __author__,
+    __description__,
+    __email__,
+    __license__,
+    __title__,
+    __url__,
+    __version__,
+)
+from platformio.compat import PY2, WINDOWS
 
-install_requires = [
-    "bottle<0.13",
-    "click>=5,<8",
+
+minimal_requirements = [
+    "bottle==0.12.*",
+    "click>=5,<9%s" % (",!=7.1,!=7.1.1" if WINDOWS else ""),
     "colorama",
-    "pyserial>=3,<4,!=3.3",
-    "requests>=2.4.0,<3",
-    "semantic_version>=2.8.1,<3",
-    "tabulate>=0.8.3,<1"
+    "marshmallow%s" % (">=2,<3" if PY2 else ">=2,<4"),
+    "pyelftools>=0.27,<1",
+    "pyserial==3.*",
+    "requests==2.*",
+    "semantic_version==2.8.*",
+    "tabulate==0.8.*",
+]
+
+if not PY2:
+    minimal_requirements.append("zeroconf==0.36.*")
+
+home_requirements = [
+    "aiofiles==0.7.*",
+    "ajsonrpc==1.*",
+    "starlette==0.16.*",
+    "uvicorn==0.15.*",
+    "wsproto==1.0.*",
 ]
 
 setup(
@@ -36,26 +58,22 @@ setup(
     author_email=__email__,
     url=__url__,
     license=__license__,
-    python_requires=", ".join([
-        ">=2.7", "!=3.0.*", "!=3.1.*", "!=3.2.*", "!=3.3.*", "!=3.4.*"]),
-    install_requires=install_requires,
-    packages=find_packages() + ["scripts"],
+    install_requires=minimal_requirements + ([] if PY2 else home_requirements),
+    packages=find_packages(exclude=["tests.*", "tests"]) + ["scripts"],
     package_data={
         "platformio": [
             "ide/tpls/*/.*.tpl",
             "ide/tpls/*/*.tpl",
             "ide/tpls/*/*/*.tpl",
-            "ide/tpls/*/.*/*.tpl"
+            "ide/tpls/*/.*/*.tpl",
         ],
-        "scripts": [
-            "99-platformio-udev.rules"
-        ]
+        "scripts": ["99-platformio-udev.rules"],
     },
     entry_points={
         "console_scripts": [
+            "platformio = platformio.__main__:main",
             "pio = platformio.__main__:main",
             "piodebuggdb = platformio.__main__:debug_gdb_main",
-            "platformio = platformio.__main__:main"
         ]
     },
     classifiers=[
@@ -66,15 +84,29 @@ setup(
         "Operating System :: OS Independent",
         "Programming Language :: C",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 2",
         "Programming Language :: Python :: 3",
         "Topic :: Software Development",
         "Topic :: Software Development :: Build Tools",
-        "Topic :: Software Development :: Compilers"
+        "Topic :: Software Development :: Compilers",
     ],
     keywords=[
-        "iot", "embedded", "arduino", "mbed", "esp8266", "esp32", "fpga",
-        "firmware", "continuous-integration", "cloud-ide", "avr", "arm",
-        "ide", "unit-testing", "hardware", "verilog", "microcontroller",
-        "debug"
-    ])
+        "iot",
+        "embedded",
+        "arduino",
+        "mbed",
+        "esp8266",
+        "esp32",
+        "fpga",
+        "firmware",
+        "continuous-integration",
+        "cloud-ide",
+        "avr",
+        "arm",
+        "ide",
+        "unit-testing",
+        "hardware",
+        "verilog",
+        "microcontroller",
+        "debug",
+    ],
+)

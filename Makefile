@@ -1,17 +1,19 @@
 lint:
-	pylint --rcfile=./.pylintrc ./platformio
+	pylint -j 6 --rcfile=./.pylintrc ./tests
+	pylint -j 6 --rcfile=./.pylintrc ./platformio
 
 isort:
-	isort -rc ./platformio
-	isort -rc ./tests
+	isort ./platformio
+	isort ./tests
 
-yapf:
-	yapf --recursive --in-place platformio/
+format:
+	black ./platformio
+	black ./tests
 
 test:
-	py.test --verbose --capture=no --exitfirst -n 3 --dist=loadscope tests --ignore tests/test_examples.py --ignore tests/test_pkgmanifest.py
+	py.test --verbose --capture=no --exitfirst -n 6 --dist=loadscope tests --ignore tests/test_examples.py
 
-before-commit: isort yapf lint test
+before-commit: isort format lint
 
 clean-docs:
 	rm -rf docs/_build
@@ -26,8 +28,11 @@ clean: clean-docs
 
 profile:
 	# Usage $ > make PIOARGS="boards" profile
-	python -m cProfile -o .tox/.tmp/cprofile.prof $(shell which platformio) ${PIOARGS}
+	python -m cProfile -o .tox/.tmp/cprofile.prof -m platformio ${PIOARGS}
 	snakeviz .tox/.tmp/cprofile.prof
+
+pack:
+	python setup.py sdist
 
 publish:
 	python setup.py sdist upload

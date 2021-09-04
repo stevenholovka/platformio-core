@@ -12,66 +12,86 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=import-error
-
 import click
-import jsonrpc
-from autobahn.twisted.websocket import (WebSocketServerFactory,
-                                        WebSocketServerProtocol)
-from jsonrpc.exceptions import JSONRPCDispatchException
-from twisted.internet import defer
+from ajsonrpc.dispatcher import Dispatcher
+from ajsonrpc.manager import AsyncJSONRPCResponseManager
+from starlette.endpoints import WebSocketEndpoint
 
-from platformio.compat import PY2, dump_json_to_unicode, is_bytes
-
-
-class JSONRPCServerProtocol(WebSocketServerProtocol):
-
-    def onMessage(self, payload, isBinary):  # pylint: disable=unused-argument
-        # click.echo("> %s" % payload)
-        response = jsonrpc.JSONRPCResponseManager.handle(
-            payload, self.factory.dispatcher).data
-        # if error
-        if "result" not in response:
-            self.sendJSONResponse(response)
-            return None
-
-        d = defer.maybeDeferred(lambda: response['result'])
-        d.addCallback(self._callback, response)
-        d.addErrback(self._errback, response)
-
-        return None
-
-    def _callback(self, result, response):
-        response['result'] = result
-        self.sendJSONResponse(response)
-
-    def _errback(self, failure, response):
-        if isinstance(failure.value, JSONRPCDispatchException):
-            e = failure.value
-        else:
-            e = JSONRPCDispatchException(code=4999,
-                                         message=failure.getErrorMessage())
-        del response["result"]
-        response['error'] = e.error._data  # pylint: disable=protected-access
-        self.sendJSONResponse(response)
-
-    def sendJSONResponse(self, response):
-        # click.echo("< %s" % response)
-        if "error" in response:
-            click.secho("Error: %s" % response['error'], fg="red", err=True)
-        response = dump_json_to_unicode(response)
-        if not PY2 and not is_bytes(response):
-            response = response.encode("utf-8")
-        self.sendMessage(response)
+from platformio.compat import aio_create_task, aio_get_running_loop
+from platformio.proc import force_exit
 
 
-class JSONRPCServerFactory(WebSocketServerFactory):
+class JSONRPCServerFactoryBase:
 
-    protocol = JSONRPCServerProtocol
+    connection_nums = 0
+    shutdown_timer = None
 
-    def __init__(self):
-        super(JSONRPCServerFactory, self).__init__()
-        self.dispatcher = jsonrpc.Dispatcher()
+    def __init__(self, shutdown_timeout=0):
+        self.shutdown_timeout = shutdown_timeout
+        self.manager = AsyncJSONRPCResponseManager(
+            Dispatcher(), is_server_error_verbose=True
+        )
 
-    def addHandler(self, handler, namespace):
-        self.dispatcher.build_method_map(handler, prefix="%s." % namespace)
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def addObjectHandler(self, handler, namespace):
+        self.manager.dispatcher.add_object(handler, prefix="%s." % namespace)
+
+    def on_client_connect(self):
+        self.connection_nums += 1
+        if self.shutdown_timer:
+            self.shutdown_timer.cancel()
+            self.shutdown_timer = None
+
+    def on_client_disconnect(self):
+        self.connection_nums -= 1
+        if self.connection_nums < 1:
+            self.connection_nums = 0
+
+        if self.connection_nums == 0:
+            self.shutdown_by_timeout()
+
+    async def on_shutdown(self):
+        pass
+
+    def shutdown_by_timeout(self):
+        if self.shutdown_timeout < 1:
+            return
+
+        def _auto_shutdown_server():
+            click.echo("Automatically shutdown server on timeout")
+            force_exit()
+
+        self.shutdown_timer = aio_get_running_loop().call_later(
+            self.shutdown_timeout, _auto_shutdown_server
+        )
+
+
+class WebSocketJSONRPCServerFactory(JSONRPCServerFactoryBase):
+    def __call__(self, *args, **kwargs):
+        ws = WebSocketJSONRPCServer(*args, **kwargs)
+        ws.factory = self
+        return ws
+
+
+class WebSocketJSONRPCServer(WebSocketEndpoint):
+    encoding = "text"
+    factory: WebSocketJSONRPCServerFactory = None
+
+    async def on_connect(self, websocket):
+        await websocket.accept()
+        self.factory.on_client_connect()  # pylint: disable=no-member
+
+    async def on_receive(self, websocket, data):
+        aio_create_task(self._handle_rpc(websocket, data))
+
+    async def on_disconnect(self, websocket, close_code):
+        self.factory.on_client_disconnect()  # pylint: disable=no-member
+
+    async def _handle_rpc(self, websocket, data):
+        # pylint: disable=no-member
+        response = await self.factory.manager.get_response_for_payload(data)
+        if response.error:
+            click.secho("Error: %s" % response.error.data, fg="red", err=True)
+        await websocket.send_text(self.factory.manager.serialize(response.body))

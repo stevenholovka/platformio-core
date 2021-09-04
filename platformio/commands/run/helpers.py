@@ -18,15 +18,14 @@ from os.path import isdir, isfile, join
 import click
 
 from platformio import fs
-from platformio.project.helpers import (compute_project_checksum,
-                                        get_project_dir,
-                                        get_project_libdeps_dir)
+from platformio.project.helpers import compute_project_checksum, get_project_dir
 
 
 def handle_legacy_libdeps(project_dir, config):
     legacy_libdeps_dir = join(project_dir, ".piolibdeps")
-    if (not isdir(legacy_libdeps_dir)
-            or legacy_libdeps_dir == get_project_libdeps_dir()):
+    if not isdir(legacy_libdeps_dir) or legacy_libdeps_dir == config.get_optional_dir(
+        "libdeps"
+    ):
         return
     if not config.has_section("env"):
         config.add_section("env")
@@ -37,9 +36,10 @@ def handle_legacy_libdeps(project_dir, config):
         "DEPRECATED! A legacy library storage `{0}` has been found in a "
         "project. \nPlease declare project dependencies in `platformio.ini`"
         " file using `lib_deps` option and remove `{0}` folder."
-        "\nMore details -> http://docs.platformio.org/page/projectconf/"
+        "\nMore details -> https://docs.platformio.org/page/projectconf/"
         "section_env_library.html#lib-deps".format(legacy_libdeps_dir),
-        fg="yellow")
+        fg="yellow",
+    )
 
 
 def clean_build_dir(build_dir, config):
@@ -54,11 +54,11 @@ def clean_build_dir(build_dir, config):
     if isdir(build_dir):
         # check project structure
         if isfile(checksum_file):
-            with open(checksum_file) as f:
-                if f.read() == checksum:
+            with open(checksum_file, encoding="utf8") as fp:
+                if fp.read() == checksum:
                     return
         fs.rmtree(build_dir)
 
     makedirs(build_dir)
-    with open(checksum_file, "w") as f:
-        f.write(checksum)
+    with open(checksum_file, mode="w", encoding="utf8") as fp:
+        fp.write(checksum)

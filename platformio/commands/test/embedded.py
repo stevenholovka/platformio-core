@@ -19,7 +19,7 @@ import serial
 
 from platformio import exception, util
 from platformio.commands.test.processor import TestProcessorBase
-from platformio.managers.platform import PlatformFactory
+from platformio.platform.factory import PlatformFactory
 
 
 class EmbeddedTestProcessor(TestProcessorBase):
@@ -27,47 +27,50 @@ class EmbeddedTestProcessor(TestProcessorBase):
     SERIAL_TIMEOUT = 600
 
     def process(self):
-        if not self.options['without_building']:
+        if not self.options["without_building"]:
             self.print_progress("Building...")
             target = ["__test"]
-            if self.options['without_uploading']:
+            if self.options["without_uploading"]:
                 target.append("checkprogsize")
             if not self.build_or_upload(target):
                 return False
 
-        if not self.options['without_uploading']:
+        if not self.options["without_uploading"]:
             self.print_progress("Uploading...")
             target = ["upload"]
-            if self.options['without_building']:
+            if self.options["without_building"]:
                 target.append("nobuild")
             else:
                 target.append("__test")
             if not self.build_or_upload(target):
                 return False
 
-        if self.options['without_testing']:
-            return None
+        if self.options["without_testing"]:
+            return True
 
         self.print_progress("Testing...")
         return self.run()
 
     def run(self):
-        click.echo("If you don't see any output for the first 10 secs, "
-                   "please reset board (press reset button)")
+        click.echo(
+            "If you don't see any output for the first 10 secs, "
+            "please reset board (press reset button)"
+        )
         click.echo()
 
         try:
-            ser = serial.Serial(baudrate=self.get_baudrate(),
-                                timeout=self.SERIAL_TIMEOUT)
+            ser = serial.Serial(
+                baudrate=self.get_baudrate(), timeout=self.SERIAL_TIMEOUT
+            )
             ser.port = self.get_test_port()
-            ser.rts = self.options['monitor_rts']
-            ser.dtr = self.options['monitor_dtr']
+            ser.rts = self.options["monitor_rts"]
+            ser.dtr = self.options["monitor_dtr"]
             ser.open()
         except serial.SerialException as e:
             click.secho(str(e), fg="red", err=True)
             return False
 
-        if not self.options['no_reset']:
+        if not self.options["no_reset"]:
             ser.flushInput()
             ser.setDTR(False)
             ser.setRTS(False)
@@ -90,9 +93,9 @@ class EmbeddedTestProcessor(TestProcessorBase):
             if not line:
                 continue
             if isinstance(line, bytes):
-                line = line.decode("utf8")
+                line = line.decode("utf8", "ignore")
             self.on_run_out(line)
-            if all([l in line for l in ("Tests", "Failures", "Ignored")]):
+            if all(l in line for l in ("Tests", "Failures", "Ignored")):
                 break
         ser.close()
         return not self._run_failed
@@ -105,23 +108,19 @@ class EmbeddedTestProcessor(TestProcessorBase):
             return self.env_options.get("test_port")
 
         assert set(["platform", "board"]) & set(self.env_options.keys())
-        p = PlatformFactory.newPlatform(self.env_options['platform'])
-        board_hwids = p.board_config(self.env_options['board']).get(
-            "build.hwids", [])
+        p = PlatformFactory.new(self.env_options["platform"])
+        board_hwids = p.board_config(self.env_options["board"]).get("build.hwids", [])
         port = None
         elapsed = 0
         while elapsed < 5 and not port:
             for item in util.get_serialports():
-                port = item['port']
+                port = item["port"]
                 for hwid in board_hwids:
                     hwid_str = ("%s:%s" % (hwid[0], hwid[1])).replace("0x", "")
-                    if hwid_str in item['hwid']:
+                    if hwid_str in item["hwid"] and self.is_serial_port_ready(port):
                         return port
 
-            # check if port is already configured
-            try:
-                serial.Serial(port, timeout=self.SERIAL_TIMEOUT).close()
-            except serial.SerialException:
+            if port and not self.is_serial_port_ready(port):
                 port = None
 
             if not port:
@@ -131,5 +130,21 @@ class EmbeddedTestProcessor(TestProcessorBase):
         if not port:
             raise exception.PlatformioException(
                 "Please specify `test_port` for environment or use "
-                "global `--test-port` option.")
+                "global `--test-port` option."
+            )
         return port
+
+    @staticmethod
+    def is_serial_port_ready(port, timeout=3):
+        if not port:
+            return False
+        elapsed = 0
+        while elapsed < timeout:
+            try:
+                serial.Serial(port, timeout=1).close()
+                return True
+            except:  # pylint: disable=bare-except
+                pass
+            sleep(1)
+            elapsed += 1
+        return False

@@ -17,261 +17,322 @@ from __future__ import absolute_import
 import os
 import shutil
 import time
-from os.path import (basename, expanduser, getmtime, isdir, isfile, join,
-                     realpath, sep)
 
-import jsonrpc  # pylint: disable=import-error
+from ajsonrpc.core import JSONRPC20DispatchException
 
 from platformio import exception, fs
 from platformio.commands.home.rpc.handlers.app import AppRPC
 from platformio.commands.home.rpc.handlers.piocore import PIOCoreRPC
-from platformio.compat import PY2, get_filesystem_encoding
 from platformio.ide.projectgenerator import ProjectGenerator
-from platformio.managers.platform import PlatformManager
+from platformio.package.manager.platform import PlatformPackageManager
 from platformio.project.config import ProjectConfig
-from platformio.project.helpers import (get_project_libdeps_dir,
-                                        get_project_src_dir,
-                                        is_platformio_project)
+from platformio.project.exception import ProjectError
+from platformio.project.helpers import get_project_dir, is_platformio_project
+from platformio.project.options import get_config_options_schema
 
 
-class ProjectRPC(object):
+class ProjectRPC:
+    @staticmethod
+    def config_call(init_kwargs, method, *args):
+        assert isinstance(init_kwargs, dict)
+        assert "path" in init_kwargs
+        project_dir = get_project_dir()
+        if os.path.isfile(init_kwargs["path"]):
+            project_dir = os.path.dirname(init_kwargs["path"])
+        with fs.cd(project_dir):
+            return getattr(ProjectConfig(**init_kwargs), method)(*args)
 
     @staticmethod
-    def _get_projects(project_dirs=None):
+    def config_load(path):
+        return ProjectConfig(
+            path, parse_extra=False, expand_interpolations=False
+        ).as_tuple()
 
-        def _get_project_data(project_dir):
+    @staticmethod
+    def config_dump(path, data):
+        config = ProjectConfig(path, parse_extra=False, expand_interpolations=False)
+        config.update(data, clear=True)
+        return config.save()
+
+    @staticmethod
+    def config_update_description(path, text):
+        config = ProjectConfig(path, parse_extra=False, expand_interpolations=False)
+        if not config.has_section("platformio"):
+            config.add_section("platformio")
+        if text:
+            config.set("platformio", "description", text)
+        else:
+            if config.has_option("platformio", "description"):
+                config.remove_option("platformio", "description")
+            if not config.options("platformio"):
+                config.remove_section("platformio")
+        return config.save()
+
+    @staticmethod
+    def get_config_schema():
+        return get_config_options_schema()
+
+    @staticmethod
+    def get_projects():
+        def _get_project_data():
             data = {"boards": [], "envLibdepsDirs": [], "libExtraDirs": []}
-            config = ProjectConfig(join(project_dir, "platformio.ini"))
-            libdeps_dir = get_project_libdeps_dir()
+            config = ProjectConfig()
+            data["envs"] = config.envs()
+            data["description"] = config.get("platformio", "description")
+            data["libExtraDirs"].extend(config.get("platformio", "lib_extra_dirs", []))
 
-            data['libExtraDirs'].extend(
-                config.get("platformio", "lib_extra_dirs", []))
-
+            libdeps_dir = config.get_optional_dir("libdeps")
             for section in config.sections():
                 if not section.startswith("env:"):
                     continue
-                data['envLibdepsDirs'].append(join(libdeps_dir, section[4:]))
+                data["envLibdepsDirs"].append(os.path.join(libdeps_dir, section[4:]))
                 if config.has_option(section, "board"):
-                    data['boards'].append(config.get(section, "board"))
-                data['libExtraDirs'].extend(
-                    config.get(section, "lib_extra_dirs", []))
+                    data["boards"].append(config.get(section, "board"))
+                data["libExtraDirs"].extend(config.get(section, "lib_extra_dirs", []))
 
             # skip non existing folders and resolve full path
             for key in ("envLibdepsDirs", "libExtraDirs"):
                 data[key] = [
-                    expanduser(d) if d.startswith("~") else realpath(d)
-                    for d in data[key] if isdir(d)
+                    fs.expanduser(d) if d.startswith("~") else os.path.realpath(d)
+                    for d in data[key]
+                    if os.path.isdir(d)
                 ]
 
             return data
 
         def _path_to_name(path):
-            return (sep).join(path.split(sep)[-2:])
-
-        if not project_dirs:
-            project_dirs = AppRPC.load_state()['storage']['recentProjects']
+            return (os.path.sep).join(path.split(os.path.sep)[-2:])
 
         result = []
-        pm = PlatformManager()
-        for project_dir in project_dirs:
+        pm = PlatformPackageManager()
+        for project_dir in AppRPC.load_state()["storage"]["recentProjects"]:
+            if not os.path.isdir(project_dir):
+                continue
             data = {}
             boards = []
             try:
                 with fs.cd(project_dir):
-                    data = _get_project_data(project_dir)
-            except exception.PlatformIOProjectException:
+                    data = _get_project_data()
+            except ProjectError:
                 continue
 
             for board_id in data.get("boards", []):
                 name = board_id
                 try:
-                    name = pm.board_config(board_id)['name']
+                    name = pm.board_config(board_id)["name"]
                 except exception.PlatformioException:
                     pass
                 boards.append({"id": board_id, "name": name})
 
-            result.append({
-                "path":
-                project_dir,
-                "name":
-                _path_to_name(project_dir),
-                "modified":
-                int(getmtime(project_dir)),
-                "boards":
-                boards,
-                "envLibStorages": [{
-                    "name": basename(d),
-                    "path": d
-                } for d in data.get("envLibdepsDirs", [])],
-                "extraLibStorages": [{
-                    "name": _path_to_name(d),
-                    "path": d
-                } for d in data.get("libExtraDirs", [])]
-            })
+            result.append(
+                {
+                    "path": project_dir,
+                    "name": _path_to_name(project_dir),
+                    "modified": int(os.path.getmtime(project_dir)),
+                    "boards": boards,
+                    "description": data.get("description"),
+                    "envs": data.get("envs", []),
+                    "envLibStorages": [
+                        {"name": os.path.basename(d), "path": d}
+                        for d in data.get("envLibdepsDirs", [])
+                    ],
+                    "extraLibStorages": [
+                        {"name": _path_to_name(d), "path": d}
+                        for d in data.get("libExtraDirs", [])
+                    ],
+                }
+            )
         return result
-
-    def get_projects(self, project_dirs=None):
-        return self._get_projects(project_dirs)
 
     @staticmethod
     def get_project_examples():
         result = []
-        for manifest in PlatformManager().get_installed():
-            examples_dir = join(manifest['__pkg_dir'], "examples")
-            if not isdir(examples_dir):
+        pm = PlatformPackageManager()
+        for pkg in pm.get_installed():
+            examples_dir = os.path.join(pkg.path, "examples")
+            if not os.path.isdir(examples_dir):
                 continue
             items = []
             for project_dir, _, __ in os.walk(examples_dir):
                 project_description = None
                 try:
-                    config = ProjectConfig(join(project_dir, "platformio.ini"))
+                    config = ProjectConfig(os.path.join(project_dir, "platformio.ini"))
                     config.validate(silent=True)
-                    project_description = config.get("platformio",
-                                                     "description")
-                except exception.PlatformIOProjectException:
+                    project_description = config.get("platformio", "description")
+                except ProjectError:
                     continue
 
-                path_tokens = project_dir.split(sep)
-                items.append({
-                    "name":
-                    "/".join(path_tokens[path_tokens.index("examples") + 1:]),
-                    "path":
-                    project_dir,
-                    "description":
-                    project_description
-                })
-            result.append({
-                "platform": {
-                    "title": manifest['title'],
-                    "version": manifest['version']
-                },
-                "items": sorted(items, key=lambda item: item['name'])
-            })
-        return sorted(result, key=lambda data: data['platform']['title'])
+                path_tokens = project_dir.split(os.path.sep)
+                items.append(
+                    {
+                        "name": "/".join(
+                            path_tokens[path_tokens.index("examples") + 1 :]
+                        ),
+                        "path": project_dir,
+                        "description": project_description,
+                    }
+                )
+            manifest = pm.load_manifest(pkg)
+            result.append(
+                {
+                    "platform": {
+                        "title": manifest["title"],
+                        "version": manifest["version"],
+                    },
+                    "items": sorted(items, key=lambda item: item["name"]),
+                }
+            )
+        return sorted(result, key=lambda data: data["platform"]["title"])
 
-    def init(self, board, framework, project_dir):
+    async def init(self, board, framework, project_dir):
         assert project_dir
         state = AppRPC.load_state()
-        if not isdir(project_dir):
+        if not os.path.isdir(project_dir):
             os.makedirs(project_dir)
         args = ["init", "--board", board]
         if framework:
             args.extend(["--project-option", "framework = %s" % framework])
-        if (state['storage']['coreCaller'] and state['storage']['coreCaller']
-                in ProjectGenerator.get_supported_ides()):
-            args.extend(["--ide", state['storage']['coreCaller']])
-        d = PIOCoreRPC.call(args, options={"cwd": project_dir})
-        d.addCallback(self._generate_project_main, project_dir, framework)
-        return d
+        if (
+            state["storage"]["coreCaller"]
+            and state["storage"]["coreCaller"] in ProjectGenerator.get_supported_ides()
+        ):
+            args.extend(["--ide", state["storage"]["coreCaller"]])
+        await PIOCoreRPC.call(
+            args, options={"cwd": project_dir, "force_subprocess": True}
+        )
+        return self._generate_project_main(project_dir, board, framework)
 
     @staticmethod
-    def _generate_project_main(_, project_dir, framework):
+    def _generate_project_main(project_dir, board, framework):
         main_content = None
         if framework == "arduino":
-            main_content = "\n".join([
-                "#include <Arduino.h>",
-                "",
-                "void setup() {",
-                "  // put your setup code here, to run once:",
-                "}",
-                "",
-                "void loop() {",
-                "  // put your main code here, to run repeatedly:",
-                "}"
-                ""
-            ])   # yapf: disable
+            main_content = "\n".join(
+                [
+                    "#include <Arduino.h>",
+                    "",
+                    "void setup() {",
+                    "  // put your setup code here, to run once:",
+                    "}",
+                    "",
+                    "void loop() {",
+                    "  // put your main code here, to run repeatedly:",
+                    "}",
+                    "",
+                ]
+            )
         elif framework == "mbed":
-            main_content = "\n".join([
-                "#include <mbed.h>",
-                "",
-                "int main() {",
-                "",
-                "  // put your setup code here, to run once:",
-                "",
-                "  while(1) {",
-                "    // put your main code here, to run repeatedly:",
-                "  }",
-                "}",
-                ""
-            ])   # yapf: disable
+            main_content = "\n".join(
+                [
+                    "#include <mbed.h>",
+                    "",
+                    "int main() {",
+                    "",
+                    "  // put your setup code here, to run once:",
+                    "",
+                    "  while(1) {",
+                    "    // put your main code here, to run repeatedly:",
+                    "  }",
+                    "}",
+                    "",
+                ]
+            )
         if not main_content:
             return project_dir
+
+        is_cpp_project = True
+        pm = PlatformPackageManager()
+        try:
+            board = pm.board_config(board)
+            platforms = board.get("platforms", board.get("platform"))
+            if not isinstance(platforms, list):
+                platforms = [platforms]
+            c_based_platforms = ["intel_mcs51", "ststm8"]
+            is_cpp_project = not (set(platforms) & set(c_based_platforms))
+        except exception.PlatformioException:
+            pass
+
         with fs.cd(project_dir):
-            src_dir = get_project_src_dir()
-            main_path = join(src_dir, "main.cpp")
-            if isfile(main_path):
+            config = ProjectConfig()
+            src_dir = config.get_optional_dir("src")
+            main_path = os.path.join(
+                src_dir, "main.%s" % ("cpp" if is_cpp_project else "c")
+            )
+            if os.path.isfile(main_path):
                 return project_dir
-            if not isdir(src_dir):
+            if not os.path.isdir(src_dir):
                 os.makedirs(src_dir)
-            with open(main_path, "w") as f:
-                f.write(main_content.strip())
+            with open(main_path, mode="w", encoding="utf8") as fp:
+                fp.write(main_content.strip())
         return project_dir
 
-    def import_arduino(self, board, use_arduino_libs, arduino_project_dir):
+    async def import_arduino(self, board, use_arduino_libs, arduino_project_dir):
         board = str(board)
-        if arduino_project_dir and PY2:
-            arduino_project_dir = arduino_project_dir.encode(
-                get_filesystem_encoding())
         # don't import PIO Project
         if is_platformio_project(arduino_project_dir):
             return arduino_project_dir
 
-        is_arduino_project = any([
-            isfile(
-                join(arduino_project_dir,
-                     "%s.%s" % (basename(arduino_project_dir), ext)))
+        is_arduino_project = any(
+            os.path.isfile(
+                os.path.join(
+                    arduino_project_dir,
+                    "%s.%s" % (os.path.basename(arduino_project_dir), ext),
+                )
+            )
             for ext in ("ino", "pde")
-        ])
+        )
         if not is_arduino_project:
-            raise jsonrpc.exceptions.JSONRPCDispatchException(
-                code=4000,
-                message="Not an Arduino project: %s" % arduino_project_dir)
+            raise JSONRPC20DispatchException(
+                code=4000, message="Not an Arduino project: %s" % arduino_project_dir
+            )
 
         state = AppRPC.load_state()
-        project_dir = join(state['storage']['projectsDir'],
-                           time.strftime("%y%m%d-%H%M%S-") + board)
-        if not isdir(project_dir):
+        project_dir = os.path.join(
+            state["storage"]["projectsDir"], time.strftime("%y%m%d-%H%M%S-") + board
+        )
+        if not os.path.isdir(project_dir):
             os.makedirs(project_dir)
         args = ["init", "--board", board]
         args.extend(["--project-option", "framework = arduino"])
         if use_arduino_libs:
-            args.extend([
-                "--project-option",
-                "lib_extra_dirs = ~/Documents/Arduino/libraries"
-            ])
-        if (state['storage']['coreCaller'] and state['storage']['coreCaller']
-                in ProjectGenerator.get_supported_ides()):
-            args.extend(["--ide", state['storage']['coreCaller']])
-        d = PIOCoreRPC.call(args, options={"cwd": project_dir})
-        d.addCallback(self._finalize_arduino_import, project_dir,
-                      arduino_project_dir)
-        return d
-
-    @staticmethod
-    def _finalize_arduino_import(_, project_dir, arduino_project_dir):
+            args.extend(
+                ["--project-option", "lib_extra_dirs = ~/Documents/Arduino/libraries"]
+            )
+        if (
+            state["storage"]["coreCaller"]
+            and state["storage"]["coreCaller"] in ProjectGenerator.get_supported_ides()
+        ):
+            args.extend(["--ide", state["storage"]["coreCaller"]])
+        await PIOCoreRPC.call(
+            args, options={"cwd": project_dir, "force_subprocess": True}
+        )
         with fs.cd(project_dir):
-            src_dir = get_project_src_dir()
-            if isdir(src_dir):
+            config = ProjectConfig()
+            src_dir = config.get_optional_dir("src")
+            if os.path.isdir(src_dir):
                 fs.rmtree(src_dir)
-            shutil.copytree(arduino_project_dir, src_dir)
+            shutil.copytree(arduino_project_dir, src_dir, symlinks=True)
         return project_dir
 
     @staticmethod
-    def import_pio(project_dir):
+    async def import_pio(project_dir):
         if not project_dir or not is_platformio_project(project_dir):
-            raise jsonrpc.exceptions.JSONRPCDispatchException(
-                code=4001,
-                message="Not an PlatformIO project: %s" % project_dir)
-        new_project_dir = join(
-            AppRPC.load_state()['storage']['projectsDir'],
-            time.strftime("%y%m%d-%H%M%S-") + basename(project_dir))
-        shutil.copytree(project_dir, new_project_dir)
+            raise JSONRPC20DispatchException(
+                code=4001, message="Not an PlatformIO project: %s" % project_dir
+            )
+        new_project_dir = os.path.join(
+            AppRPC.load_state()["storage"]["projectsDir"],
+            time.strftime("%y%m%d-%H%M%S-") + os.path.basename(project_dir),
+        )
+        shutil.copytree(project_dir, new_project_dir, symlinks=True)
 
         state = AppRPC.load_state()
         args = ["init"]
-        if (state['storage']['coreCaller'] and state['storage']['coreCaller']
-                in ProjectGenerator.get_supported_ides()):
-            args.extend(["--ide", state['storage']['coreCaller']])
-        d = PIOCoreRPC.call(args, options={"cwd": new_project_dir})
-        d.addCallback(lambda _: new_project_dir)
-        return d
+        if (
+            state["storage"]["coreCaller"]
+            and state["storage"]["coreCaller"] in ProjectGenerator.get_supported_ides()
+        ):
+            args.extend(["--ide", state["storage"]["coreCaller"]])
+        await PIOCoreRPC.call(
+            args, options={"cwd": new_project_dir, "force_subprocess": True}
+        )
+        return new_project_dir

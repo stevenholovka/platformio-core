@@ -12,20 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from platformio import exception, telemetry
-from platformio.commands.platform import \
-    platform_install as cmd_platform_install
+from platformio.commands.platform import init_platform
 from platformio.commands.test.processor import CTX_META_TEST_RUNNING_NAME
-from platformio.managers.platform import PlatformFactory
+from platformio.project.exception import UndefinedEnvPlatformError
 
 # pylint: disable=too-many-instance-attributes
 
 
 class EnvironmentProcessor(object):
-
     def __init__(  # pylint: disable=too-many-arguments
-            self, cmd_ctx, name, config, targets, upload_port, silent, verbose,
-            jobs):
+        self, cmd_ctx, name, config, targets, upload_port, silent, verbose, jobs
+    ):
         self.cmd_ctx = cmd_ctx
         self.name = name
         self.config = config
@@ -40,40 +37,34 @@ class EnvironmentProcessor(object):
         variables = {"pioenv": self.name, "project_config": self.config.path}
 
         if CTX_META_TEST_RUNNING_NAME in self.cmd_ctx.meta:
-            variables['piotest_running_name'] = self.cmd_ctx.meta[
-                CTX_META_TEST_RUNNING_NAME]
+            variables["piotest_running_name"] = self.cmd_ctx.meta[
+                CTX_META_TEST_RUNNING_NAME
+            ]
 
         if self.upload_port:
             # override upload port with a custom from CLI
-            variables['upload_port'] = self.upload_port
+            variables["upload_port"] = self.upload_port
         return variables
 
     def get_build_targets(self):
-        if self.targets:
-            return [t for t in self.targets]
-        return self.config.get("env:" + self.name, "targets", [])
+        return (
+            self.targets
+            if self.targets
+            else self.config.get("env:" + self.name, "targets", [])
+        )
 
     def process(self):
         if "platform" not in self.options:
-            raise exception.UndefinedEnvPlatform(self.name)
+            raise UndefinedEnvPlatformError(self.name)
 
         build_vars = self.get_build_variables()
-        build_targets = self.get_build_targets()
-
-        telemetry.on_run_environment(self.options, build_targets)
+        build_targets = list(self.get_build_targets())
 
         # skip monitor target, we call it above
         if "monitor" in build_targets:
             build_targets.remove("monitor")
 
-        try:
-            p = PlatformFactory.newPlatform(self.options['platform'])
-        except exception.UnknownPlatform:
-            self.cmd_ctx.invoke(cmd_platform_install,
-                                platforms=[self.options['platform']],
-                                skip_default_package=True)
-            p = PlatformFactory.newPlatform(self.options['platform'])
-
-        result = p.run(build_vars, build_targets, self.silent, self.verbose,
-                       self.jobs)
-        return result['returncode'] == 0
+        result = init_platform(self.options["platform"]).run(
+            build_vars, build_targets, self.silent, self.verbose, self.jobs
+        )
+        return result["returncode"] == 0
